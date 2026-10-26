@@ -1,0 +1,14 @@
+{
+  "AppVersion": "1.0.0.0",
+  "Title": "Nocturne Pointillist Water",
+  "Thumbnail": "",
+  "Preview": "",
+  "Desc": "A nocturnal pointillist ocean that reacts to system audio and the cursor.",
+  "Author": "saj",
+  "License": "",
+  "Contact": "",
+  "Type": 1,
+  "FileName": "index.html",
+  "Arguments": "--audio",
+  "IsAbsolutePath": false
+}

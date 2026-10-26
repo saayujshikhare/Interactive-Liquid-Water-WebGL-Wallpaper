@@ -1,0 +1,2420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Nocturne Pointillist Water — Interactive Liquid Simulation</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background-color: #03060c;
+      user-select: none;
+      -webkit-user-select: none;
+      cursor: default;
+    }
+
+    canvas#water-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      pointer-events: auto;
+    }
+
+    canvas#clock-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      display: block;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    .watermark {
+      position: fixed;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      z-index: 3;
+      pointer-events: none;
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      line-height: 1;
+      letter-spacing: 0.26em;
+      text-indent: 0.26em;
+      color: rgba(158, 234, 255, 0.48);
+      text-shadow: 0 0 12px rgba(80, 210, 255, 0.35);
+      opacity: 0.9;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="water-canvas"></canvas>
+  <canvas id="clock-canvas" aria-hidden="true"></canvas>
+  <div class="watermark" aria-hidden="true">@saj</div>
+
+  <script>
+    (function () {
+      'use strict';
+
+      const canvas = document.getElementById('water-canvas');
+      const gl =
+        canvas.getContext('webgl2', {
+          alpha: false,
+          depth: false,
+          stencil: false,
+          antialias: false,
+          powerPreference: 'high-performance',
+          preserveDrawingBuffer: true
+        }) ||
+        canvas.getContext('webgl', {
+          alpha: false,
+          depth: false,
+          stencil: false,
+          antialias: false,
+          powerPreference: 'high-performance',
+          preserveDrawingBuffer: true
+        });
+
+      if (!gl) {
+        document.body.style.background =
+          'radial-gradient(circle at 50% 50%, #092038 0%, #03060c 100%)';
+        return;
+      }
+
+      const vertexShaderSource = `
+        attribute vec2 aPosition;
+        varying vec2 vUv;
+        void main() {
+          vUv = aPosition * 0.5 + 0.5;
+          gl_Position = vec4(aPosition, 0.0, 1.0);
+        }
+      `;
+
+      const fragmentShaderSource = `
+        #ifdef GL_FRAGMENT_PRECISION_HIGH
+        precision highp float;
+        #else
+        precision mediump float;
+        #endif
+
+        varying vec2 vUv;
+
+        uniform vec2 uResolution;
+        // Dot-lattice density in rows across the uv height. Driven from JS off the CSS
+        // height (not the framebuffer), so the stipple stays exactly as fine as it was
+        // no matter what render scale the GPU budget settles on.
+        uniform float uDotDensity;
+        uniform float uTime;
+        // uMouse: x = aspectX, y = uvY, z = velX, w = velY
+        uniform vec4 uMouse;
+        // uMouseEnergy: x = waterEnergy, y = airEnergy
+        uniform vec2 uMouseEnergy;
+        // Live splash records. When this is 0 every splash/wake loop can be skipped,
+        // which is the common case for an idle wallpaper.
+        uniform float uActiveSplashes;
+        // uSplashes[i]: x = originAspectX, y = originUvY, z = birthTime, w = packedVelAndStrength
+        uniform vec4 uSplashes[16];
+        // Ambient bubbles, precomputed once per frame on the CPU: x, y, radius, fade.
+        // Replaces ~90 hash evaluations per pixel with a single vec4 fetch.
+        uniform vec4 uBubbles[40];
+        // Fish school: uFishA = (x, y, size, dir), uFishB = (pitch, flap, big, 0)
+        uniform vec4 uFishA[9];
+        uniform vec4 uFishB[9];
+        // Seagulls: uGullA = (x, y, halfWingspan, dir), uGullB = (wingBeat, 0, 0, 0)
+        uniform vec4 uGullA[5];
+        uniform vec4 uGullB[5];
+        // System audio from Lively's --audio API: (bass, mid, treble, level) + beat envelope
+        uniform vec4 uAudio;
+        uniform float uBeat;
+        // Jellyfish simulated on the CPU: uJellyA = (x, y, bellW, bellH),
+        // uJellyB = (tentacleAmp, tentaclePhase, lean, glow)
+        uniform vec4 uJellyA[2];
+        uniform vec4 uJellyB[2];
+
+        // =========================================================================
+        // HASH & ORGANIC NOISE FUNCTIONS
+        // =========================================================================
+        float hash11(float p) {
+          p = fract(p * 0.1031);
+          p *= p + 33.33;
+          p *= p + p;
+          return fract(p);
+        }
+
+        float hash21(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.x + p3.y) * p3.z);
+        }
+
+        vec2 hash22(vec2 p) {
+          vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+          p3 += dot(p3, p3.yzx + 33.33);
+          return fract((p3.xx + p3.yz) * p3.zy);
+        }
+
+        float noise2D(vec2 p) {
+          vec2 i = floor(p);
+          vec2 f = fract(p);
+          vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+
+          vec2 ga = hash22(i + vec2(0.0, 0.0)) * 2.0 - 1.0;
+          vec2 gb = hash22(i + vec2(1.0, 0.0)) * 2.0 - 1.0;
+          vec2 gc = hash22(i + vec2(0.0, 1.0)) * 2.0 - 1.0;
+          vec2 gd = hash22(i + vec2(1.0, 1.0)) * 2.0 - 1.0;
+
+          float va = dot(ga, f - vec2(0.0, 0.0));
+          float vb = dot(gb, f - vec2(1.0, 0.0));
+          float vc = dot(gc, f - vec2(0.0, 1.0));
+          float vd = dot(gd, f - vec2(1.0, 1.0));
+
+          return mix(mix(va, vb, u.x), mix(vc, vd, u.x), u.y);
+        }
+
+        // 1D Quintic value noise with exact analytical derivative: vec2(val, dVal/dx)
+        vec2 noise1D_deriv(float x) {
+          float i = floor(x);
+          float f = fract(x);
+          float u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+          float du = 30.0 * f * f * (f - 1.0) * (f - 1.0);
+
+          float a = hash11(i) * 2.0 - 1.0;
+          float b = hash11(i + 1.0) * 2.0 - 1.0;
+          return vec2(mix(a, b, u), (b - a) * du);
+        }
+
+        // =========================================================================
+        // INTERACTIVE MOUSE SLOSH, WAKE & SPLASH CRATERS
+        // =========================================================================
+        // Unpack signed horizontal velocity and positive strength from sp.w
+        void unpackSplash(float packedVal, out float outVelX, out float outStrength) {
+          float sgn = packedVal < 0.0 ? -1.0 : 1.0;
+          float a = abs(packedVal);
+          float vNorm = floor(a) / 50.0 - 1.0;
+          outVelX = vNorm * 2.2;
+          outStrength = fract(a) * 2.0 * sgn;
+        }
+
+        // Returns vec3(verticalDisp, dDisp/dx, splashTurbulence)
+        vec3 evaluateInteractiveWaves(float x, float t) {
+          float disp = 0.0;
+          float ddisp = 0.0;
+          float turb = 0.0;
+
+          // GPU fast path: with no cursor energy in the water and no live splashes the
+          // whole solver (including its 16-slot ring loop) is skipped entirely.
+          if (uMouseEnergy.x <= 0.001 && uActiveSplashes < 0.5) {
+            return vec3(0.0, 0.0, 0.0);
+          }
+
+          // 1. Live cursor wake & slosh cavity ONLY when mouse is in/near the water (never when in air)
+          float waterMouseEnergy = uMouseEnergy.x;
+          if (waterMouseEnergy > 0.001) {
+            // Attenuate surface wave wake if cursor is deep underwater so deep cursor mostly makes local underwater swirls
+            float surfaceProx = exp(-max(0.0, 0.49 - uMouse.y) * 5.2);
+            float effEnergy = waterMouseEnergy * surfaceProx;
+            if (effEnergy > 0.001) {
+              float dx = x - uMouse.x;
+              float sigma = 0.135;
+              float invS2 = 1.0 / (sigma * sigma);
+              float env = exp(-dx * dx * invS2);
+
+              // Heavy, viscous meniscus: one broad slow dimple that settles monotonically
+              // (no springy rebound) plus a short directional drag with the cursor.
+              float dimple = -0.016 * env;
+              float dDimple = 0.032 * dx * invS2 * env;
+
+              float dragAmp = 0.011 * clamp(uMouse.z, -1.6, 1.6);
+              float dragEnv = exp(-abs(dx) * 11.0);
+              float drag = dragAmp * dx * dragEnv;
+              float dDrag = dragAmp * dragEnv * (1.0 - 11.0 * abs(dx));
+
+              // Barely-there meniscus breath: very low amplitude and slow, like thick
+              // liquid. No fast springy capillary oscillation.
+              float whisperAmp = 0.0016 * effEnergy;
+              float whisperPhase = dx * 9.0 - t * 1.7;
+              float whisper = whisperAmp * sin(whisperPhase) * exp(-abs(dx) * 4.0);
+              float dWhisper =
+                whisperAmp * exp(-abs(dx) * 4.0) *
+                (9.0 * cos(whisperPhase) - 4.0 * sign(dx) * sin(whisperPhase));
+
+              disp += (dimple + drag + whisper) * effEnergy;
+              ddisp += (dDimple + dDrag + dWhisper) * effEnergy;
+              turb += env * effEnergy * 0.7;
+            }
+          }
+
+          // 2. Propagating ring waves & sloshing wakes from water splashes (scaled by how close the source y is to the surface)
+          for (int i = 0; i < 16; i++) {
+            vec4 sp = uSplashes[i];
+            float age = t - sp.z;
+            if (age > 0.0 && age < 4.2 && sp.w > 0.0001) {
+              float spVelX;
+              float spStrength;
+              unpackSplash(sp.w, spVelX, spStrength);
+
+              // Deep underwater splashes affect the top surface less than surface splashes
+              float depthBelowSurf = max(0.0, 0.50 - sp.y);
+              float surfCoupling = exp(-depthBelowSurf * 5.5);
+
+              if (surfCoupling > 0.02 && spStrength > 0.01) {
+                float dx = x - sp.x;
+                float dist = abs(dx);
+                float sgn = dx >= 0.0 ? 1.0 : -1.0;
+
+                float strength = clamp(spStrength, 0.0, 1.8) * surfCoupling;
+                // Heavy parting meniscus that sinks once and settles (no elastic rebound)
+                float settle = exp(-age * 4.2) + 0.35 * exp(-age * 1.3);
+                float dimpleShape = exp(-dist * dist * 120.0);
+                float dimple = -0.020 * strength * settle * dimpleShape;
+                float dDimple = 0.020 * strength * settle * 240.0 * dx * dimpleShape;
+
+                // Slow, viscous outward wake: long wavelength, quick heavy decay
+                float waveSpeed = 0.12;
+                float radius = 0.025 + age * waveSpeed;
+                float packetWidth = 0.060 + age * 0.075;
+                float delta = (dist - radius) / packetWidth;
+                float packetEnv = exp(-delta * delta * 1.5) * exp(-dist * 3.2) * exp(-age * 2.2) * smoothstep(0.0, 0.05, age);
+
+                float k = 24.0 / (1.0 + age * 0.5);
+                float phase = dist * k - age * 6.8 + dx * spVelX * 2.0;
+                float ring = sin(phase);
+                float dRing = (k * sgn + spVelX * 2.0) * cos(phase);
+                float dEnv = packetEnv * (-3.0 * delta / packetWidth - 3.2) * sgn;
+
+                float amp = 0.0060 * strength;
+                disp += dimple + amp * packetEnv * ring;
+                ddisp += dDimple + amp * (dEnv * ring + packetEnv * dRing);
+                turb += packetEnv * strength * 0.55;
+              }
+            }
+          }
+
+          disp = clamp(disp, -0.068, 0.068);
+          return vec3(disp, clamp(ddisp, -2.2, 2.2), clamp(turb, 0.0, 1.6));
+        }
+
+        // =========================================================================
+        // NATURAL, STRONG, ORGANIC MULTI-SCALE FLUID WAVES
+        // =========================================================================
+        // Blends strong, heavy trochoidal gravity swells with domain-warped fBm
+        // so waves have dramatic, powerful vertical heave and rolling momentum
+        // while staying completely irregular and natural (never robotic sine loops).
+        // Returns vec4(surfaceY, slopeDyDx, crestFoaminess, waveEnergy)
+        vec4 evaluateNaturalWaveLayer(float x, float t, float layerId) {
+          // Heavy, viscous time scale: long slow rollers rather than springy wobble
+          float speedMult = (1.0 - layerId * 0.14) * 0.95;
+          float ampMult = 1.0 - layerId * 0.18;
+          float ts = t * speedMult;
+          float seedOffset = layerId * 19.37;
+
+          // Very slow group envelope so big sets arrive and pass like real ocean rollers
+          vec2 envN = noise1D_deriv(x * 0.23 - ts * 0.06 + seedOffset);
+          float groupEnv = 0.92 + 0.22 * envN.x;
+
+          // Large-scale horizontal domain warp: long swells stretch and compress shorter waves
+          vec2 warp1 = noise1D_deriv(x * 0.42 - ts * 0.15 + seedOffset * 0.7);
+          vec2 warp2 = noise1D_deriv(x * 1.03 + ts * 0.12 - seedOffset * 1.3);
+          float xWarped = x + warp1.x * 0.20 + warp2.x * 0.07;
+          float dxWarped = 1.0 + warp1.y * 0.42 * 0.20 + warp2.y * 1.03 * 0.07;
+
+          // Primary long-period ocean swell (one dominant heavy roller weight)
+          float p1 = xWarped * 3.15 - ts * 0.46 + warp1.x * 0.95 + seedOffset;
+          float s1 = sin(p1);
+          float c1 = cos(p1);
+          // Steepened crest with a broad flat trough: heavy water, not a bouncing spring
+          float swell1 = c1 + 0.28 * (c1 * c1 - s1 * s1);
+          float dSwell1 = (3.15 * dxWarped + warp1.y * 0.42 * 0.95) * (-s1 - 1.12 * s1 * c1);
+
+          // Narrow crest ridge: a real swell peak is sharp and asymmetric, not a
+          // smooth cosine hump. This sharpens the lip and steepens the face.
+          float crestRidge = pow(max(c1, 0.0), 7.0);
+          float dCrestRidge =
+            -7.0 * pow(max(c1, 0.0), 6.0) * s1 *
+            (3.15 * dxWarped + warp1.y * 0.42 * 0.95);
+          swell1 += crestRidge * 0.55;
+          dSwell1 += dCrestRidge * 0.55;
+
+          // Secondary long swell (much weaker so it deepens the sea, never fights the roller)
+          float p2 = xWarped * 5.60 - ts * 0.68 - warp2.x * 0.80 + 4.7 + seedOffset * 1.6;
+          float s2 = sin(p2);
+          float c2 = cos(p2);
+          float swell2 = c2 + 0.18 * (c2 * c2 - s2 * s2);
+          float dSwell2 = (5.60 * dxWarped - warp2.y * 1.03 * 0.80) * (-s2 - 0.72 * s2 * c2);
+
+          // Octave 1: Slow irregular ocean surge
+          vec2 nOct1 = noise1D_deriv(xWarped * 1.60 - ts * 0.24 + 3.1 + seedOffset);
+          float raw1 = nOct1.x;
+          float shaped1 = raw1 + 0.30 * (raw1 * raw1 - 0.35);
+          float dShaped1 = nOct1.y * 1.60 * dxWarped * (1.0 + 0.60 * raw1);
+
+          // Octave 2: Slow cross-moving swell
+          vec2 nOct2 = noise1D_deriv(xWarped * 3.20 + ts * 0.20 + 11.4 + seedOffset * 1.7);
+          float raw2 = nOct2.x;
+          float shaped2 = raw2 + 0.22 * (raw2 * raw2 - 0.32);
+          float dShaped2 = nOct2.y * 3.20 * dxWarped * (1.0 + 0.44 * raw2);
+
+          // Octave 3: Restrained wind-driven chop riding on the swell backs
+          float chopWarp = xWarped - (swell1 * 0.10 + shaped1 * 0.14);
+          vec2 nOct3 = noise1D_deriv(chopWarp * 5.20 - ts * 0.44 + 23.7 + seedOffset * 2.3);
+          float shaped3 = nOct3.x + 0.18 * nOct3.x * abs(nOct3.x);
+          float dShaped3 = nOct3.y * 5.20 * dxWarped * (1.0 + 0.36 * abs(nOct3.x));
+
+          // Octave 4: Fine asymmetrical capillary texture (kept subtle so it never looks rubbery)
+          vec2 nOct4 = noise1D_deriv(chopWarp * 8.80 - ts * 0.72 + 41.2 + seedOffset * 3.1);
+          float shaped4 = nOct4.x;
+          float dShaped4 = nOct4.y * 8.80 * dxWarped;
+
+          // Combine swells + fBm octaves: strong slow heave, low springy interference
+          float h =
+            (swell1 * 0.058 +
+             swell2 * 0.013 +
+             shaped1 * 0.034 +
+             shaped2 * 0.019 +
+             shaped3 * 0.008 +
+             shaped4 * 0.0032) * ampMult * groupEnv;
+
+          float dh =
+            (dSwell1 * 0.058 +
+             dSwell2 * 0.013 +
+             dShaped1 * 0.034 +
+             dShaped2 * 0.019 +
+             dShaped3 * 0.008 +
+             dShaped4 * 0.0032) * ampMult * groupEnv;
+
+          // System audio lifts the swell with the bass and adds a little crest energy
+          // on the beat. Deliberately small so the ocean stays majestic, not a strobe.
+          float audioHeave = 1.0 + uAudio.x * 0.16 + uAudio.y * 0.05 + uBeat * 0.035;
+          h *= audioHeave;
+          dh *= audioHeave;
+
+          float splashTurb = 0.0;
+          if (layerId < 1.5) {
+            float mWeight = layerId < 0.5 ? 1.0 : 0.48;
+            vec3 inter = evaluateInteractiveWaves(x, uTime);
+            h += inter.x * mWeight;
+            dh += inter.y * mWeight;
+            splashTurb = inter.z * mWeight;
+          }
+
+          // Strict 50% vertical horizon anchor.
+          // h is clamped well beyond any reachable crest so the sky fast path above
+          // y = 0.75 (which skips wave evaluation) can never cut off a real wave.
+          float baseLine = 0.496 + layerId * 0.0055;
+          float surfaceY = baseLine + clamp(h, -0.18, 0.18);
+
+          // Natural crest peaking & whitecap energy metric
+          // Whitecaps belong only to the highest, steepest peaks. Using h directly
+          // (not a normalized ramp) keeps the whole surface from turning white.
+          float crestLift = smoothstep(0.015, 0.080, h);
+          float crestSteep = smoothstep(0.025, 0.22, abs(dh));
+          float crestness = clamp(crestLift * (0.55 + 0.45 * crestSteep) + splashTurb * 0.35, 0.0, 1.0);
+          float steepness = clamp(abs(dh) * 1.9 + splashTurb * 0.6, 0.0, 1.0);
+
+          return vec4(surfaceY, dh, crestness, steepness);
+        }
+
+        // =========================================================================
+        // VOLUMETRIC CAUSTICS IN WATER COLUMN
+        // =========================================================================
+        float computeCaustics(vec2 p, float t) {
+          vec2 uv1 = p * vec2(3.4, 2.3) + vec2(-t * 0.28, t * 0.14);
+          vec2 uv2 = p * vec2(5.7, 3.5) + vec2(t * 0.22, -t * 0.19);
+          float n1 = abs(noise2D(uv1));
+          float n2 = abs(noise2D(uv2 + vec2(n1 * 0.6)));
+          return pow(clamp(1.0 - (n1 * 0.52 + n2 * 0.48) * 1.8, 0.0, 1.0), 3.0);
+        }
+
+        // =========================================================================
+        // BIOLUMINESCENT SEA LIFE — POINTILLIST FISH SCHOOL & DRIFTING JELLYFISH
+        // =========================================================================
+        // Animals are painted by the same pointillist lattice: every dot samples the
+        // fish/jellyfish pigment field, so they appear stippled into the water — never
+        // pasted on as solid shapes.
+        vec3 applySeaLife(vec2 p, float uvY, float t, vec3 waterCol, out float lifeAmount) {
+          lifeAmount = 0.0;
+          if (uvY > 0.47 || uvY < 0.015) return waterCol;
+
+          // Adapt the living space to the viewport width (portrait through ultrawide)
+          float halfW = 0.5 * uResolution.x / max(uResolution.y, 1.0);
+          float swimSpan = max(0.55, halfW * 1.35);
+
+          // ------------------------- FISH SCHOOL --------------------------------
+          for (int f = 0; f < 9; f++) {
+            // Per-frame state comes from the CPU — the loop body is now pure geometry,
+            // with no hashes or transcendentals left in it.
+            vec4 fA = uFishA[f];
+            vec4 fB = uFishB[f];
+            float size = fA.z;
+            float dir = fA.w;
+            float big = fB.z;
+
+            // Cheap bounding reject before evaluating the fish silhouette
+            if (abs(p.x - fA.x) > size * 1.8 || abs(uvY - fA.y) > size * 0.7) continue;
+
+            vec2 q = (p - vec2(fA.x, fA.y)) / size;
+            q.x *= dir;
+
+            // Gentle body pitch and tail flap (angles precomputed per frame)
+            float pitch = fB.x;
+            q = mat2(cos(pitch), -sin(pitch), sin(pitch), cos(pitch)) * q;
+
+            float flap = fB.y * clamp(-q.x - 0.55, 0.0, 1.0);
+            q.y += flap * step(q.x, -0.35);
+
+            // Elliptical body (half-height 0.34 of half-length)
+            float body = q.x * q.x + (q.y * q.y) / 0.1156;
+
+            // Wedge-shaped tail fin with a soft animated sweep
+            float ti = clamp((-q.x - 0.62) / 0.78, 0.0, 1.0);
+            float tailHalf = mix(0.10, 0.40, ti) * (1.0 - smoothstep(0.92, 1.0, ti));
+            float tail = (q.x < -0.62 && q.x > -1.40)
+              ? (1.0 - smoothstep(tailHalf * 0.55, tailHalf, abs(q.y)))
+              : 0.0;
+
+            float inside = max(step(body, 1.0), tail);
+            if (inside > 0.02) {
+              float rim = smoothstep(0.62, 1.0, body);
+              float belly = smoothstep(0.45, -0.55, q.y);
+              vec3 fishCol = mix(
+                vec3(0.006, 0.055, 0.120),
+                vec3(0.080, 0.520, 0.660),
+                belly * 0.85
+              );
+              // Cold rim light along the back and fins (bioluminescent edge)
+              fishCol += vec3(0.42, 0.95, 1.00) * rim * (0.40 + 0.30 * big);
+              fishCol += vec3(0.05, 0.30, 0.38) * exp(-max(0.0, body - 1.0) * 2.0) * 0.35;
+
+              // Eye and pin-point glint
+              float eyeDist = length(vec2(q.x - 0.58, q.y - 0.06));
+              fishCol = mix(fishCol, vec3(0.005, 0.020, 0.045), 1.0 - smoothstep(0.14, 0.20, eyeDist));
+              fishCol = mix(fishCol, vec3(0.85, 1.00, 1.00), 1.0 - smoothstep(0.055, 0.085, eyeDist));
+
+              waterCol = mix(waterCol, fishCol, 0.94);
+              lifeAmount = max(lifeAmount, inside);
+            }
+          }
+
+          // ------------------------- JELLYFISH ----------------------------------
+          // Bell position, pulse contraction, drift lean and tentacle sway are all
+          // simulated on the CPU (random wander + wave orbital motion + viscous cursor
+          // evasion) and arrive as uniforms. The GPU only paints the geometry, which
+          // removes the old per-pixel path/pulse trigonometry.
+          for (int j = 0; j < 2; j++) {
+            vec4 jA = uJellyA[j];
+            vec4 jB = uJellyB[j];
+            float bellW = max(jA.z, 0.012);
+            float bellH = max(jA.w, 0.010);
+            vec2 q = p - jA.xy;
+            if (abs(q.x) > bellW * 3.6 + 0.02 || q.y < -0.165 || q.y > bellH * 2.4) continue;
+
+            // Upper dome of the bell, open underneath; the skirt fades softly so the
+            // translucent body never resolves into a rectangular patch.
+            float bell = length(vec2(q.x / bellW, (q.y - bellH * 0.10) / bellH));
+            float bellSkirt = smoothstep(-bellH * 0.92, -bellH * 0.24, q.y);
+            float bellMask = bellSkirt * (1.0 - smoothstep(0.70, 1.0, bell));
+            float bellRim = bellSkirt * smoothstep(0.70, 0.94, bell) * (1.0 - smoothstep(0.96, 1.08, bell));
+
+            float tentacle = 0.0;
+            for (int k = 0; k < 5; k++) {
+              float fk = float(k);
+              float rootX = (fk - 2.0) * bellW * 0.32;
+              // Trailing, viscous strands: lean opposite the drift, sway with the pulse
+              float strandX = rootX
+                + jB.z * (-q.y)
+                + sin(jB.y - q.y * 45.0 + fk * 1.7) * jB.x * max(-q.y, 0.0);
+              float strand = exp(-(q.x - strandX) * (q.x - strandX) * 52000.0);
+              strand *= smoothstep(-0.005, -0.020, q.y) * exp(-max(0.0, -q.y - 0.020) * 7.0);
+              tentacle = max(tentacle, strand);
+            }
+
+            if (bellMask + bellRim + tentacle > 0.02) {
+              float glow = max(jB.w, 0.35);
+              vec3 jellyCol = mix(
+                vec3(0.10, 0.36, 0.46),
+                vec3(0.34, 0.92, 1.00),
+                bellRim * 0.85
+              );
+              jellyCol += vec3(0.20, 0.90, 0.95) * tentacle * 0.55;
+              jellyCol += vec3(0.55, 1.00, 1.00) * bellRim * 0.30 * glow;
+              // System-audio shimmer through the gel, strongest on the rim
+              jellyCol += vec3(0.10, 0.32, 0.34) * uAudio.w * (bellMask * 0.6 + bellRim);
+              float jellyMask = clamp(bellMask * 0.70 + bellRim * 0.85 + tentacle * 0.55, 0.0, 1.0);
+              waterCol = mix(waterCol, jellyCol, jellyMask);
+              lifeAmount = max(lifeAmount, jellyMask * 0.7);
+            }
+          }
+
+          return waterCol;
+        }
+
+        // =========================================================================
+        // CONTINUOUS FIELD EVALUATOR (SAMPLED AT EACH POINTILLIST DOT CENTER)
+        // =========================================================================
+        // Evaluates the dark-theme water & sky optical field at a specific point p (aspectX, uvY)
+        // Returns:
+        //   col: RGB pigment color
+        //   region: 0.0 = dark sky, 1.0 = back/mid wave, 2.0 = foreground water, 3.0 = crest/foam highlight
+        //   luminance: optical intensity for dot sizing
+        void sampleSceneAtPoint(
+          vec2 p,
+          float uvY,
+          float t,
+          vec4 waveBack,
+          vec4 waveMid,
+          vec4 waveFront,
+          out vec3 outCol,
+          out float outRegion,
+          out float outDotScale
+        ) {
+          // 1. DARK THEME TOP 50% BACKGROUND (Nocturnal Obsidian / Deep Abyssal Slate)
+          vec3 skyZenith  = vec3(0.014, 0.024, 0.048);
+          vec3 skyHorizon = vec3(0.035, 0.078, 0.138);
+          float skyGrad = smoothstep(0.45, 1.0, uvY);
+          vec3 skyCol = mix(skyHorizon, skyZenith, pow(skyGrad, 0.7));
+
+          // Subtle nocturnal moonlight / bioluminescent mist glow near the 50% water horizon
+          float horizonMist = exp(-abs(uvY - 0.50) * 9.5) * (0.65 + 0.35 * cos(p.x * 1.4 - t * 0.15));
+          skyCol += vec3(0.018, 0.085, 0.145) * horizonMist * (1.0 + uAudio.w * 0.55 + uBeat * 0.20);
+
+          // Air stir: the pointer now disturbs the whole night sky it crosses — a soft
+          // luminous drag and a slower wind ring around it. Only the air reacts; the
+          // water below the horizon stays untouched by movement up here.
+          float airHalo = 0.0;
+          if (uMouseEnergy.y > 0.001 && uMouse.y > 0.50) {
+            vec2 dAir = vec2(p.x - uMouse.x, uvY - uMouse.y);
+            float r2 = dot(dAir, dAir);
+            float halo = exp(-r2 * 30.0) * uMouseEnergy.y;
+            float ring = exp(-r2 * 8.0) * uMouseEnergy.y;
+            skyCol += vec3(0.034, 0.080, 0.128) * halo;
+            skyCol += vec3(0.012, 0.030, 0.052) * ring;
+            skyCol += vec3(0.020, 0.050, 0.080) * ring * ring * 0.6;
+            airHalo = 0.30 * halo + 0.13 * ring;
+          }
+
+          outCol = skyCol;
+          outRegion = 0.0;
+          outDotScale = 0.52 + 0.22 * horizonMist + airHalo;
+
+          // 1b. POINTILLIST SEAGULLS GLIDING THROUGH THE CLEAN UPPER AIR
+          if (uvY > 0.585) {
+            float skyHalfW = 0.5 * uResolution.x / max(uResolution.y, 1.0);
+            float gullSpan = skyHalfW * 1.25;
+            for (int g = 0; g < 5; g++) {
+              // Flight state precomputed on the CPU: position, wingspan, heading, beat
+              vec4 gA = uGullA[g];
+              vec4 gB = uGullB[g];
+              float W = gA.z;
+              float gDir = gA.w;
+
+              vec2 q = (p - vec2(gA.x, gA.y)) * vec2(gDir, 1.0);
+              if (abs(q.x) > W * 1.30 || abs(q.y) > W * 1.20) continue;
+
+              vec2 qq = q / W;
+              float u = qq.x;
+              float v = qq.y;
+              float uAbs = abs(u);
+
+              // Wing beat: a thin swept curve whose tips rise and fall
+              float beat = gB.x;
+              float wingY = beat * u * u;
+              float dv = v - wingY;
+              float wingH = (0.10 + 0.13 * max(0.0, 1.0 - uAbs)) *
+                            (1.0 - smoothstep(0.86, 1.04, uAbs));
+              float wing = (1.0 - smoothstep(wingH - 0.07, wingH + 0.07, abs(dv))) *
+                           (1.0 - smoothstep(1.02, 1.07, uAbs));
+
+              // Compact body where the wings meet, plus a small forward head
+              float body = 1.0 - smoothstep(0.55, 0.85, length(vec2(u / 0.30, dv / 0.36)));
+              float head = 1.0 - smoothstep(0.45, 0.75, length(vec2((u - 0.24) / 0.13, (dv - 0.06) / 0.13)));
+              float gull = max(max(wing, body), head);
+
+              if (gull > 0.02) {
+                float lit = smoothstep(0.16, -0.30, dv);
+                vec3 gullCol = mix(vec3(0.030, 0.055, 0.095), vec3(0.52, 0.78, 0.94), gull * 0.88);
+                gullCol += vec3(0.35, 0.55, 0.65) * lit * 0.30 * gull;
+                skyCol = mix(skyCol, gullCol, clamp(gull, 0.0, 1.0));
+                outDotScale = max(outDotScale, 0.52 + 0.60 * gull);
+              }
+            }
+            outCol = skyCol;
+          }
+
+          // 2. NATURAL WAVE LAYERS — evaluated once per pixel by the caller and passed in
+          //    (recomputing them here used to double the wave-solver cost of every pixel)
+
+          // 3. DISTANT SWELL LAYER
+          if (uvY < waveBack.x) {
+            float dBack = waveBack.x - uvY;
+            vec3 nBack = normalize(vec3(-waveBack.y, 1.0, 0.5));
+            vec3 lightDir = normalize(vec3(-0.25, 0.85, 0.46));
+            vec3 viewDir = vec3(0.0, 0.15, 0.99);
+            float specBack = pow(max(dot(nBack, normalize(lightDir + viewDir)), 0.0), 64.0);
+            float rimBack = exp(-dBack * 130.0);
+            // Stratified water body behind the main swell: heavier tone lower down,
+            // plus a glass sheet line so the distant sea is not a flat fill.
+            float strataB = 0.5 + 0.5 * noise1D_deriv(p.x * 2.3 + dBack * 7.5 - t * 0.22).x;
+            float belowB = smoothstep(0.0, 0.22, dBack);
+
+            vec3 backCol = mix(
+              vec3(0.010, 0.115, 0.235),
+              vec3(0.060, 0.460, 0.680),
+              clamp(waveBack.z * 0.62 + rimBack * 0.55, 0.0, 1.0)
+            );
+            backCol *= (0.74 + 0.50 * strataB) * (1.0 - 0.42 * belowB);
+            backCol += vec3(0.52, 0.93, 1.0) * (rimBack * 0.55 + specBack * 0.80);
+            backCol += vec3(0.10, 0.42, 0.58)
+                     * pow(0.5 + 0.5 * cos(dBack * 74.0 + strataB * 3.4 + t * 0.05), 6.0)
+                     * exp(-dBack * 8.0) * 0.40;
+
+            outCol = backCol;
+            outRegion = 1.0;
+            outDotScale = 0.78 + 0.18 * rimBack;
+          }
+
+          // 4. MID TRANSLUCENT WAVE LAYER
+          if (uvY < waveMid.x) {
+            float dMid = waveMid.x - uvY;
+            vec3 nMid = normalize(vec3(-waveMid.y, 1.0, 0.42));
+            vec3 lightDir = normalize(vec3(-0.20, 0.88, 0.44));
+            vec3 viewDir = vec3(0.0, 0.12, 0.99);
+            float specMid = pow(max(dot(nMid, normalize(lightDir + viewDir)), 0.0), 85.0);
+            float rimMid = exp(-dMid * 150.0);
+            float sssMid = exp(-dMid * 26.0) * (0.5 + 0.5 * waveMid.z);
+            float strataM = 0.5 + 0.5 * noise1D_deriv(p.x * 3.1 + dMid * 6.2 - t * 0.28).x;
+            float belowM = smoothstep(0.0, 0.26, dMid);
+
+            vec3 midCol = mix(
+              vec3(0.012, 0.170, 0.380),
+              vec3(0.180, 0.860, 0.960),
+              sssMid
+            );
+            midCol *= 0.80 + 0.42 * strataM;
+            midCol *= 1.0 - 0.34 * belowM;
+            // One internal sheet crossing the mid swell, warped along its length
+            midCol += vec3(0.16, 0.62, 0.78)
+                    * pow(0.5 + 0.5 * cos(dMid * 96.0 + strataM * 3.0 + p.x * 2.6 - t * 0.1), 7.0)
+                    * exp(-dMid * 9.0) * 0.45;
+            midCol += vec3(0.75, 0.99, 1.0) * (rimMid * 0.55 + specMid * 0.85);
+
+            outCol = midCol;
+            outRegion = 1.5;
+            outDotScale = 0.84 + 0.18 * (rimMid + sssMid * 0.5);
+          }
+
+          // 5. FOREGROUND WATER VOLUME — INTERNAL SHEET OPTICS
+          // ---------------------------------------------------------------------
+          // Not one vertical gradient: the interior is advected with the surface
+          // slope, a domain-warped thickness field decides how much light survives
+          // the trip, and stacked internal sheets leave bright glass ridges with
+          // heavy dark water between them.
+          if (uvY < waveFront.x) {
+            float depth = max(waveFront.x - uvY, 0.0);
+            float slope = clamp(waveFront.y, -2.4, 2.4);
+            float crest = waveFront.z;
+            float steep = waveFront.w;
+            float ribbonFactor = exp(-depth * 26.0);
+
+            // Interior shear: the mass under a steep face leans the way that face
+            // is moving, so the column rotates instead of sliding as a flat slab.
+            float wx = p.x + slope * depth * 2.2;
+
+            // ---- domain-warped fold field (3 texture fetches) ------------------
+            vec2 fA = vec2(wx * 1.30 + 4.7, depth * 5.0 - t * 0.075);
+            float warpA = noise2D(fA);
+            float fold = noise2D(fA + vec2(warpA * 0.80, warpA * 0.55) + 11.3);   // broad folds
+            float foldFine = noise1D_deriv(wx * 5.2 - depth * 11.0 + fold * 2.4 + 1.3).x;
+            float mass = noise2D(vec2(wx * 0.58 + 8.3, depth * 2.0 - t * 0.045));
+
+            // ---- warped optical thickness --------------------------------------
+            float thickness = max(
+              depth
+                + fold * 0.048
+                + foldFine * 0.013
+                + mass * 0.052 * smoothstep(0.0, 0.18, depth),
+              0.0
+            );
+
+            // ---- stacked internal sheets ---------------------------------------
+            // Five discrete glass sheets, each drifting at its own depth and
+            // curvature and each fading with the water above it. Discrete sheets,
+            // not a periodic comb: a comb reads as contour lines, drifting sheets
+            // read as layered water.
+            float ridge = 0.0;
+            float ridgeEdge = 0.0;
+            float sheetBody = 0.0;
+            float ridgeDark = 0.0;
+            for (int s = 0; s < 4; s++) {
+              float fs = float(s);
+              vec2 ns = noise1D_deriv(wx * (1.10 + fs * 0.42) + fs * 6.3);
+
+              // Sheet depth below the surface, curved by the fold field and its
+              // own slow wander along the swell
+              float sd = 0.018 + fs * 0.052
+                       + ns.x * (0.030 + fs * 0.009)
+                       + fold * 0.014;
+              float d = depth - sd;
+
+              float w = 0.0036 + 0.0012 * fs;
+              float dn = d / w;
+              float e = exp(-dn * dn);
+              float dc = dn * 2.38;
+              float core = exp(-dc * dc);
+              float dl = (d + 0.020) * 33.0;
+              float lit = exp(-dl * dl);
+              float under = smoothstep(0.002, 0.040, d) * exp(-max(d, 0.0) * 9.0);
+
+              // Each sheet fades in and out along the swell, never all at once
+              e *= clamp(0.65 + 0.85 * ns.x, 0.0, 1.45);
+              lit *= 0.60 + 0.50 * ns.x;
+
+              // Water above a sheet absorbs its light
+              float atten = exp(-sd * 2.2);
+              ridge += e * atten;
+              ridgeEdge += core * atten;
+              sheetBody += lit * atten * 0.22;
+              ridgeDark += under * atten * 0.40;
+            }
+
+            // ---- volumetric absorption -----------------------------------------
+            // Red dies first, so the column runs white-cyan -> vivid cyan ->
+            // sapphire -> indigo purely from how much water the light crossed.
+            vec3 trans = exp(-(thickness * 9.5) * vec3(0.95, 0.44, 0.30));
+            vec3 litBody = vec3(0.780, 0.960, 0.960);
+            vec3 deepBody = vec3(0.045, 0.155, 0.345);
+
+            float facing = clamp(0.55 - slope * 0.40, 0.12, 1.10);
+            float lightAmt = 0.52 + 0.72 * facing + 0.55 * mass;
+
+            vec3 waterCol = deepBody * (0.62 + 0.55 * (0.5 + 0.5 * mass))
+                          + litBody * trans * lightAmt;
+
+            // Clearer water between folds, denser water inside them
+            waterCol = mix(
+              waterCol,
+              waterCol * 1.18 + vec3(0.010, 0.055, 0.075),
+              0.45 * sheetBody
+            );
+            // Heavy water stacked below every sheet edge: this is what gives the
+            // column its glassy thickness instead of a smooth ramp.
+            waterCol *= 1.0 - 0.62 * ridgeDark;
+            // Broad shadow pools in the thick folds: the dark navy masses that make
+            // the lit glass edges read as light, not paint.
+            waterCol *= 1.0 - 0.52 * smoothstep(0.10, 0.80, -fold) * exp(-thickness * 1.2);
+            // Bright glass edges where the sheets turn over
+            waterCol += vec3(0.42, 0.93, 1.00) * ridge * exp(-thickness * 1.0)
+                      * (0.40 + 0.65 * facing) * 0.30;
+            waterCol += vec3(0.90, 0.99, 1.00) * ridgeEdge * exp(-thickness * 0.9)
+                      * (0.35 + 0.85 * facing) * 0.90;
+
+            // Long, soft downward light curtains inside the mass
+            float curtain = pow(0.5 + 0.5 * cos(wx * 17.0 + fold * 5.0 + mass * 2.0), 8.0);
+            waterCol += vec3(0.10, 0.42, 0.56) * curtain * exp(-thickness * 7.0) * 0.35;
+
+            // Internal caustics travelling with the warped thickness field
+            vec2 causticCoord = vec2(wx * 2.6 + slope * depth * 1.6, thickness * 6.8 - t * 0.16);
+            float caustics = pow(clamp(1.0 - abs(noise2D(causticCoord)) * 1.7, 0.0, 1.0), 3.0);
+            float causticMask = exp(-thickness * 2.4) * smoothstep(0.004, 0.02, depth);
+            waterCol += vec3(0.20, 0.86, 1.00) * caustics * causticMask
+                      * (0.45 + 0.55 * crest) * (0.75 + uAudio.w * 0.25) * 1.05;
+
+            // Subsurface transmission through the thin crest sheet
+            float thinTrans = exp(-depth * 58.0) * (0.35 + 0.80 * crest + 0.35 * steep);
+            waterCol += vec3(0.26, 0.86, 1.00) * thinTrans * 0.24;
+            waterCol += vec3(0.74, 0.99, 1.00) * pow(thinTrans, 2.2) * 0.30;
+
+            // ---- surface optics ------------------------------------------------
+            vec3 surfaceNormal = normalize(vec3(
+              -slope * (0.95 + 0.50 * ribbonFactor),
+              0.72 + 0.28 * ribbonFactor,
+              0.40 + 0.22 * (1.0 - ribbonFactor)
+            ));
+            vec3 viewDir = vec3(0.0, 0.10, 0.995);
+            vec3 mainLight = normalize(vec3(-0.20, 0.88, 0.44));
+            float cosTheta = clamp(dot(surfaceNormal, viewDir), 0.0, 1.0);
+            float fresnel = 0.02 + 0.98 * pow(1.0 - cosTheta, 4.0);
+            float spec = pow(max(dot(surfaceNormal, normalize(mainLight + viewDir)), 0.0), 150.0);
+
+            // Barely-there underside shadow just below the lip: the crest reads as
+            // a sheet with real thickness rather than a painted bright edge.
+            float underLip = exp(-pow((depth - 0.016) / 0.011, 2.0));
+            waterCol *= 1.0 - 0.16 * underLip * clamp(crest * 1.4, 0.0, 1.0);
+
+            // White water where the crest actually breaks
+            float foamNoise = noise1D_deriv(p.x * 14.0 - t * 0.7 + wx * 2.2).x;
+            float foamTex = clamp(0.40 + 0.85 * foamNoise, 0.0, 1.0);
+            float foamCrest = smoothstep(0.44, 0.86, crest + steep * 0.32)
+                            * exp(-depth * 34.0) * (0.35 + 0.95 * foamTex);
+            float capEdge = smoothstep(0.58, 0.94, crest + steep * 0.20)
+                          * exp(-depth * 90.0);
+            float breakFoam = smoothstep(0.30, 0.90, steep) * exp(-depth * 26.0)
+                            * (0.45 + 0.75 * foamTex);
+            // Shadow pocket under a steep lip: the dark band that makes the white
+            // crest read as a real overhanging sheet of water.
+            float underCurl = smoothstep(0.003, 0.018, depth)
+                            * (1.0 - smoothstep(0.030, 0.095, depth))
+                            * smoothstep(0.20, 0.80, steep);
+            waterCol *= 1.0 - 0.48 * underCurl;
+            // Surface glitter: pinpoint speculars skittering along the crest
+            float glitter = pow(0.5 + 0.5 * cos(wx * 38.0 + fold * 6.0 + t * 0.4), 26.0)
+                          * exp(-depth * 45.0) * smoothstep(0.25, 0.85, steep);
+            waterCol += vec3(0.92, 1.00, 1.00) * glitter * 0.55;
+
+            float whiteGleam =
+              exp(-depth * 150.0) * (0.16 + 0.55 * crest + 0.75 * spec) +
+              ribbonFactor * (spec * 1.85 + fresnel * 0.32) +
+              foamCrest * 0.95 +
+              capEdge * 0.45 +
+              breakFoam * 0.85 +
+              exp(-depth * 70.0) * smoothstep(0.30, 0.90, crest * 0.6 + steep * 0.7) * 0.90 +
+              uAudio.y * 0.05 + uBeat * 0.04;
+
+            // Break the whitecap into frothy holes so it reads as aerated water
+            float foamHoles = clamp(
+              0.50 + 0.90 * noise1D_deriv(p.x * 33.0 - t * 1.1 + depth * 10.0).x,
+              0.0, 1.0
+            );
+            whiteGleam *= 0.64 + 0.36 * foamHoles;
+
+            // Aerated froth: clustered white bubbles breaking up the crest cap
+            float froth = noise1D_deriv(wx * 21.0 - depth * 44.0 - t * 0.5).x;
+            whiteGleam += smoothstep(0.38, 0.84, crest) * exp(-depth * 20.0)
+                        * smoothstep(0.05, 0.70, froth * 0.6 + 0.5) * 0.90;
+            waterCol += vec3(0.88, 0.97, 1.00) * clamp(whiteGleam, 0.0, 1.20);
+            waterCol = mix(waterCol, vec3(0.42, 0.50, 0.56), 0.06);
+
+            // Localized source agitation glow & cavitation ripples around submerged/surface splash origins
+            float localSourceGlow = 0.0;
+            if (uMouseEnergy.x > 0.001 && uMouse.y <= waveFront.x + 0.02) {
+              float dCursor = length(vec2(p.x - uMouse.x, uvY - uMouse.y));
+              float cGlow = exp(-dCursor * dCursor * 210.0) * uMouseEnergy.x;
+              float cRing = (0.5 + 0.5 * cos(dCursor * 60.0 - t * 6.0)) * exp(-dCursor * 20.0) * uMouseEnergy.x;
+              localSourceGlow += cGlow * 0.55 + cRing * 0.28;
+            }
+
+            if (uActiveSplashes > 0.5) for (int i = 0; i < 16; i++) {
+              vec4 sp = uSplashes[i];
+              float age = t - sp.z;
+              if (age > 0.0 && age < 1.8 && sp.w > 0.0001) {
+                float spVelX;
+                float spStrength;
+                unpackSplash(sp.w, spVelX, spStrength);
+                vec2 dSp = vec2(p.x - sp.x, uvY - sp.y);
+                float distSp = length(dSp);
+                if (distSp < 0.24) {
+                  float ringR = 0.012 + age * 0.14;
+                  float ringBand = exp(-pow((distSp - ringR) / (0.022 + age * 0.025), 2.0));
+                  float fadeSp = exp(-age * 2.1) * clamp(spStrength, 0.0, 1.6);
+                  localSourceGlow += ringBand * fadeSp * 0.62;
+                }
+              }
+            }
+
+            waterCol += vec3(0.38, 0.96, 1.00) * clamp(localSourceGlow, 0.0, 0.95);
+
+            // Pointillist sea life drifting through the translucent volume
+            float lifeAmount = 0.0;
+            waterCol = applySeaLife(p, uvY, t, waterCol, lifeAmount);
+
+            outCol = waterCol;
+            outRegion = (whiteGleam + localSourceGlow * 0.7) > 0.42 ? 3.0 : 2.0;
+            outDotScale = 0.82 + 0.24 * clamp(
+              thinTrans + whiteGleam * 0.6 + localSourceGlow * 0.65 +
+              ridge * 0.5 + caustics * causticMask * 0.4,
+              0.0, 1.0
+            );
+          } else {
+            // Salt-spray mist above the highest crests. Only the top few pixels get it,
+            // so the clean upper air stays clean while breaking water reads as spray.
+            float aboveCrest = uvY - waveFront.x;
+            if (aboveCrest > 0.0 && aboveCrest < 0.14) {
+              float spray = smoothstep(0.55, 0.90, waveFront.z) * exp(-aboveCrest * 55.0);
+              float sprayNoise = noise1D_deriv(p.x * 21.0 - t * 0.8 + waveFront.y * 4.0).x;
+              float sprayMask = clamp(0.35 + 0.65 * sprayNoise, 0.0, 1.0);
+              outCol += vec3(0.20, 0.50, 0.56) * spray * sprayMask * 0.90;
+
+              // Larger airborne spray beads: a high-frequency plume of white/cyan
+              // speckles rising off the steepest crests, like a breaking wave crown.
+              float plume = smoothstep(0.62, 0.95, waveFront.z) * exp(-aboveCrest * 15.0);
+              float speckNoise = noise1D_deriv(p.x * 84.0 + aboveCrest * 95.0 - t * 2.4).x;
+              float speck = smoothstep(0.18, 0.72, speckNoise);
+              float sprayBeads = plume * speck;
+              outCol += vec3(0.55, 0.90, 1.00) * sprayBeads * 0.80;
+              outDotScale += 0.24 * spray * sprayMask + 0.30 * sprayBeads;
+            }
+
+            // In the upper 50% air region: moving the mouse in the air ONLY stirs the air dots subtly
+            if (uMouseEnergy.y > 0.001 && uMouse.y > waveFront.x) {
+              float dAir = length(vec2(p.x - uMouse.x, uvY - uMouse.y));
+              float airSwirl = exp(-dAir * dAir * 95.0) * uMouseEnergy.y;
+              outCol += vec3(0.016, 0.042, 0.075) * airSwirl;
+              outDotScale += 0.22 * airSwirl;
+            }
+          }
+        }
+
+        // =========================================================================
+        // POINTILLISM-STYLE BALLISTIC SPLASHES (AT EXACT SOURCE) & AMBIENT DROPLETS
+        // =========================================================================
+        // Evaluates interactive mouse splash plumes / underwater cavitation bubbles
+        // right at their exact 2D source (sp.x, sp.y), plus natural wave-crest spray.
+        // localWave: foreground wave, already evaluated by the caller — passing it in
+        // removes a fourth full wave-solver run from every single pixel.
+        vec4 evaluateSplashAndSprayDots(vec2 p, float uvY, float t, float pixelSize, vec4 localWave) {
+          vec4 bestDot = vec4(0.0);
+          float halfW = 0.5 * uResolution.x / max(uResolution.y, 1.0);
+
+          // A. INTERACTIVE MOUSE SPLASHES AT EXACT SOURCE (sp.x, sp.y)
+          if (uActiveSplashes > 0.5) for (int i = 0; i < 16; i++) {
+            vec4 sp = uSplashes[i];
+            float age = t - sp.z;
+            // Active splash duration up to 1.65 seconds
+            if (age > 0.0 && age < 1.65 && sp.w > 0.0001) {
+              float spVelX;
+              float spStrength;
+              unpackSplash(sp.w, spVelX, spStrength);
+
+              // Quick 2D bounding box reject around the exact splash source (sp.x, sp.y)
+              if (abs(p.x - sp.x) < 0.30 && abs(uvY - sp.y) < 0.34) {
+                float launchX = sp.x;
+                float launchY = sp.y;
+                float depthBelow = max(0.0, 0.495 - launchY);
+                // Near the surface (depthBelow ~ 0), droplets arc up and fall under gravity;
+                // Deeper underwater, cavitation bubbles & turbulence beads burst radially and drift upward with buoyancy
+                float isUnderwater = smoothstep(0.02, 0.10, depthBelow);
+                float effGravity = mix(0.46, -0.09, isUnderwater);
+                float drag = mix(1.0, (1.0 - exp(-age * 3.2)) / (3.2 * max(age, 0.001)), isUnderwater * 0.7);
+                float fade = (1.0 - smoothstep(1.00, 1.65, age)) * smoothstep(0.0, 0.025, age);
+
+                // 12 fine pointillist splash/cavitation beads per burst originating right at (launchX, launchY)
+                for (int j = 0; j < 12; j++) {
+                  float fj = float(j);
+                  float seed = fj * 13.7 + sp.z * 43.1 + float(i) * 7.9;
+                  float h1 = hash11(seed);
+                  float h2 = hash11(seed + 5.3);
+                  float h3 = hash11(seed + 11.7);
+
+                  // Radial burst + mouse velocity carry from the exact cursor source
+                  float angle = (h1 - 0.5) * 3.14159 * mix(0.85, 1.85, isUnderwater);
+                  float burstSpeed = (0.09 + 0.19 * h2) * clamp(spStrength, 0.35, 1.65);
+                  float vx = sin(angle) * burstSpeed * 0.95 + spVelX * (0.18 + 0.20 * h2);
+                  float vy = cos(angle) * burstSpeed * mix(1.15, 0.75, isUnderwater) + mix(0.08, 0.03, isUnderwater) * spStrength;
+
+                  float ageEff = age * drag;
+                  float dropX = launchX + vx * ageEff;
+                  float dropY = launchY + vy * ageEff - 0.5 * effGravity * age * age;
+
+                  // Fine, high-definition pointillist dot radius for this splash/cavitation bead
+                  float dotRadius = (0.0016 + 0.0019 * h3) * (0.72 + 0.28 * fade);
+                  vec2 diff = vec2(p.x - dropX, uvY - dropY);
+                  float dist = length(diff);
+
+                  if (dist < dotRadius + pixelSize * 1.25) {
+                    float mask = 1.0 - smoothstep(dotRadius - pixelSize * 0.85, dotRadius + pixelSize * 0.85, dist);
+                    vec2 localUv = diff / max(dotRadius, 0.0001);
+
+                    // Crisp pointillist pigment bead with highlight gleam (luminous cyan-white in air or underwater foam)
+                    float highlight = smoothstep(0.65, 0.0, length(localUv - vec2(-0.28, 0.32)));
+                    float submergeTint = smoothstep(localWave.x + 0.01, localWave.x - 0.06, dropY);
+                    vec3 beadCyan = mix(
+                      vec3(0.24, 0.92, 1.00),
+                      vec3(0.10, 0.78, 0.96),
+                      submergeTint * 0.55
+                    );
+                    vec3 beadCol = mix(beadCyan, vec3(1.0, 1.0, 1.0), 0.42 + 0.52 * highlight);
+
+                    float alpha = mask * fade;
+                    if (alpha > bestDot.a) {
+                      bestDot = vec4(beadCol, alpha);
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // B. AMBIENT BUBBLES RISING FROM THE DEEP (crisp glassy pointillist rings)
+          // Positions come precomputed from the CPU (uBubbles), so this loop is now a
+          // cheap bounding test instead of 5 hashes + 3 sines per bubble per pixel.
+          if (uvY < 0.50) for (int b = 0; b < 40; b++) {
+            vec4 bub = uBubbles[b];
+            if (bub.w <= 0.001) continue;
+
+            float radius = bub.z;
+            // Cheap circular bounding reject
+            if (abs(p.x - bub.x) > radius * 1.4 || abs(uvY - bub.y) > radius * 1.4) continue;
+
+            vec2 bd = vec2(p.x - bub.x, uvY - bub.y);
+            float distB = length(bd);
+            if (distB < radius * 1.30) {
+              float ring = smoothstep(radius * 0.62, radius * 0.92, distB) *
+                           (1.0 - smoothstep(radius * 0.95, radius * 1.22, distB));
+              float glint = 1.0 - smoothstep(0.0, radius * 0.55, length(bd - vec2(-radius * 0.32, radius * 0.36)));
+              float interior = (1.0 - smoothstep(0.0, radius * 0.75, distB)) * 0.10;
+
+              vec3 bubbleCol = mix(
+                vec3(0.20, 0.70, 0.82),
+                vec3(0.95, 1.00, 1.00),
+                clamp(ring + glint, 0.0, 1.0)
+              );
+              float alphaB = (ring * 0.85 + glint * 0.90 + interior) * bub.w;
+              if (alphaB > bestDot.a) {
+                bestDot = vec4(bubbleCol, alphaB);
+              }
+            }
+          }
+
+          // C. NATURAL CREST HOVERING DROPLETS (Fine pointillist mist beads near wave peaks)
+          if (uvY > 0.42 && uvY < 0.68) {
+            for (int k = 0; k < 42; k++) {
+              float fk = float(k);
+              float cycle = 5.2 + hash11(fk * 19.1 + 2.0) * 3.0;
+              float phase = hash11(fk * 37.3 + 5.0) * cycle;
+              float localT = mod(t + phase, cycle);
+              float life = localT / cycle;
+
+              float activeWin = smoothstep(0.10, 0.25, life) * (1.0 - smoothstep(0.75, 0.92, life));
+              if (activeWin > 0.01) {
+                float cycleIdx = floor((t + phase) / cycle);
+                float dSeed = fk * 61.7 + cycleIdx * 23.3;
+                float baseX = (hash11(dSeed + 0.7) * 2.0 - 1.0) * halfW * 0.95;
+                float driftX = baseX + (life - 0.5) * 0.14 + sin(t * 1.1 + fk) * 0.015;
+
+                if (abs(p.x - driftX) < 0.020) {
+                  vec4 wCrest = evaluateNaturalWaveLayer(driftX, t, 0.0);
+                  float arc = 4.0 * life * (1.0 - life);
+                  float hoverY = wCrest.x + 0.007 + (0.034 + 0.030 * hash11(dSeed + 3.1)) * arc;
+                  float radius =
+                    (0.0027 + 0.0038 * hash11(dSeed + 8.2)) *
+                    (0.72 + 0.34 * activeWin) *
+                    (0.80 + 0.50 * wCrest.z);
+
+                  vec2 diff = vec2(p.x - driftX, uvY - hoverY);
+                  float dist = length(diff);
+                  if (dist < radius + pixelSize * 1.25) {
+                    float mask = 1.0 - smoothstep(radius - pixelSize * 0.85, radius + pixelSize * 0.85, dist);
+                    vec2 localUv = diff / max(radius, 0.0001);
+                    float gleam = smoothstep(0.6, 0.0, length(localUv - vec2(-0.25, 0.30)));
+
+                    vec3 dropCol = mix(
+                      vec3(0.22, 0.92, 1.00),
+                      vec3(1.0, 1.0, 1.0),
+                      0.35 + 0.55 * gleam
+                    );
+                    // Floating beads belong at breaking crests, not over flat water.
+                    float crestGate = smoothstep(0.30, 0.85, wCrest.z);
+                    float alpha = mask * activeWin * crestGate;
+                    if (alpha > bestDot.a) {
+                      bestDot = vec4(dropCol, alpha);
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          return bestDot;
+        }
+
+        // =========================================================================
+        // MAIN POINTILLISM COMPOSITOR
+        // =========================================================================
+        void main() {
+          vec2 uv = vUv;
+          float minDim = max(min(uResolution.x, uResolution.y), 1.0);
+          float aspect = uResolution.x / max(uResolution.y, 1.0);
+          vec2 p = vec2((uv.x - 0.5) * aspect, uv.y);
+          float pixelSize = 1.0 / max(uResolution.y, 1.0);
+
+          // Dark canvas ground between pointillist dots (deep midnight obsidian)
+          vec3 darkGround = mix(
+            vec3(0.008, 0.015, 0.032),
+            vec3(0.012, 0.022, 0.044),
+            1.0 - uv.y
+          );
+
+          // -----------------------------------------------------------------------
+          // 1. CONSTRUCT HIGH-DEFINITION ORGANIC STAGGERED POINTILLIST DOT LATTICE
+          // -----------------------------------------------------------------------
+          // High-definition organic staggered pointillist dot lattice. Density comes
+          // from the CSS height, so lowering render scale never coarsens the dots.
+          float gridDensity = uDotDensity;
+
+          // Gentle fluid/air coordinate advection so the pointillist dots respond
+          // locally to water waves in the bottom 50% and exclusively to air currents in the top 50%
+          vec2 flowOffset = vec2(0.0);
+          if (uv.y < 0.54) {
+            float waterWeight = smoothstep(0.54, 0.44, uv.y);
+            // The pointillist lattice itself follows the current: depth-dependent
+            // orbital flow bends the dots into visible water sheets instead of leaving
+            // a static gradient field.
+            float waterDepth = max(0.0, 0.50 - uv.y);
+            float flowAmp = 0.0012 + 0.0050 * exp(-waterDepth * 3.2);
+            float swellShiftX = sin(p.x * 3.0 + waterDepth * 20.0 - uTime * 0.42) * flowAmp;
+            float swellShiftY = cos(p.x * 2.2 - waterDepth * 14.0 + uTime * 0.30) * flowAmp * 0.55;
+
+            // Local underwater/surface stir right at the cursor source
+            if (uMouseEnergy.x > 0.001) {
+              vec2 dWater = vec2(p.x - uMouse.x, uv.y - uMouse.y);
+              float wDist2 = dot(dWater, dWater);
+              float wSwirl = exp(-wDist2 * 130.0) * uMouseEnergy.x;
+              swellShiftX += uMouse.z * 0.0055 * wSwirl;
+              swellShiftY += uMouse.w * 0.0055 * wSwirl;
+            }
+            flowOffset = vec2(swellShiftX, swellShiftY) * waterWeight;
+          } else {
+            // Top 50% Air: when air is moved, ONLY air moves around the cursor
+            if (uMouseEnergy.y > 0.001) {
+              vec2 dAir = vec2(p.x - uMouse.x, uv.y - uMouse.y);
+              float airDist2 = dot(dAir, dAir);
+              float airWake = exp(-airDist2 * 62.0) * uMouseEnergy.y;
+              vec2 ortho = normalize(dAir + vec2(0.0001, 0.0));
+              // Drag the stars with the pointer and give them a slow vortex around it
+              flowOffset = (vec2(uMouse.z, uMouse.w) * 0.0125 + ortho * (uMouse.z * 0.075)) * airWake;
+            }
+          }
+
+          vec2 gridSpace = (p + flowOffset) * gridDensity;
+          // Stagger every odd row by 0.5 for a natural hexagonal/painterly packing
+          float rowIndex = floor(gridSpace.y);
+          float rowStagger = mod(rowIndex, 2.0) * 0.5;
+          vec2 staggeredSpace = vec2(gridSpace.x + rowStagger, gridSpace.y);
+
+          vec2 baseCell = floor(staggeredSpace);
+          vec2 localCell = fract(staggeredSpace);
+
+          // Search 3x3 neighborhood of jittered pointillist dot centers so dots never clip at cell boundaries
+          float minDist = 10.0;
+          vec2 bestCellId = baseCell;
+          vec2 bestCenterGrid = vec2(0.0);
+          vec2 bestDelta = vec2(0.0);
+
+          for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+              vec2 neighbor = vec2(float(dx), float(dy));
+              vec2 cellId = baseCell + neighbor;
+              vec2 rnd = hash22(cellId);
+
+              // Organic painterly hand-placed jitter within the cell
+              vec2 jitter = (rnd - 0.5) * 0.42;
+              vec2 centerInStaggered = cellId + vec2(0.5) + jitter;
+              vec2 delta = staggeredSpace - centerInStaggered;
+              float dist = length(delta);
+
+              if (dist < minDist) {
+                minDist = dist;
+                bestCellId = cellId;
+                bestDelta = delta;
+                float neighborStagger = mod(floor(cellId.y), 2.0) * 0.5;
+                bestCenterGrid = vec2(centerInStaggered.x - neighborStagger, centerInStaggered.y);
+              }
+            }
+          }
+
+          // Convert winning dot's center back into world/UV coordinates
+          vec2 dotWorldP = bestCenterGrid / gridDensity - flowOffset;
+          float dotUvY = clamp(dotWorldP.y, 0.0, 1.0);
+
+          // -----------------------------------------------------------------------
+          // 2. SAMPLE SCENE COLOR & OPTICAL PROPERTIES AT THE DOT CENTER
+          // -----------------------------------------------------------------------
+          // GPU fast path: the wave solver cannot reach above y = 0.75, so the whole
+          // top quarter of the screen skips it (unless a splash is airborne up there).
+          // Lazy solving: the foreground layer is solved first and the back layers are
+          // only solved when the point is NOT already covered by the layer in front of
+          // them. Deep water therefore costs ONE solve instead of three, and only
+          // points above every crest pay for all three — same pixels, same colors.
+          bool needWaves =
+            dotUvY < 0.75 || uActiveSplashes > 0.5 || uMouseEnergy.x > 0.001;
+          vec4 waveBack  = vec4(0.0);
+          vec4 waveMid   = vec4(0.0);
+          vec4 waveFront = vec4(0.496, 0.0, 0.0, 0.0);
+          if (needWaves) {
+            waveFront = evaluateNaturalWaveLayer(dotWorldP.x, uTime, 0.0);
+            if (dotUvY >= waveFront.x) {
+              waveMid = evaluateNaturalWaveLayer(dotWorldP.x, uTime, 1.0);
+              if (dotUvY >= waveMid.x) {
+                waveBack = evaluateNaturalWaveLayer(dotWorldP.x, uTime, 2.0);
+              }
+            }
+          }
+
+          vec3 dotColor;
+          float dotRegion;
+          float dotScale;
+          sampleSceneAtPoint(dotWorldP, dotUvY, uTime, waveBack, waveMid, waveFront, dotColor, dotRegion, dotScale);
+
+          // -----------------------------------------------------------------------
+          // 3. SEURAT/SIGNAC POINTILLIST CHROMATIC PIGMENT VARIATION
+          // -----------------------------------------------------------------------
+          // In authentic pointillism, neighboring dots carry subtle hue/luminance shifts
+          // that optically blend into vibrant, shimmering water and dark nocturnal sky.
+          vec2 cellRnd = hash22(bestCellId * 1.73 + vec2(17.1, 31.7));
+          float pigmentShift = cellRnd.x * 2.0 - 1.0;
+          float lumShift = cellRnd.y * 2.0 - 1.0;
+
+          if (dotRegion > 0.5) {
+            // Water volume & wave crests: alternate between cobalt, emerald-aqua, and electric cyan-white
+            vec3 warmAquaTint = vec3(-0.018, 0.034, 0.024) * pigmentShift;
+            vec3 brightSparkle = vec3(0.030, 0.045, 0.050) * max(0.0, lumShift);
+            dotColor = clamp(dotColor + warmAquaTint + brightSparkle, 0.0, 1.0);
+
+            // Occasional shimmering specular pearl dot on illuminated wave slopes & crests
+            if (dotRegion > 2.5 && cellRnd.y > 0.62) {
+              dotColor = mix(dotColor, vec3(0.95, 1.00, 1.00), 0.55);
+              dotScale = max(dotScale, 0.96);
+            }
+          } else {
+            // Dark-theme upper sky: subtle deep indigo / midnight slate stipple variation
+            dotColor += vec3(0.008, 0.015, 0.028) * (pigmentShift * 0.5 + 0.5);
+          }
+
+          // -----------------------------------------------------------------------
+          // 4. COMPUTE POINTILLIST DOT RADIUS & RADIAL BRUSH PROFILE
+          // -----------------------------------------------------------------------
+          float sizeJitter = 0.88 + 0.24 * cellRnd.x;
+          // Water dots sit much fuller than sky dots: the surface reads as a
+          // continuous glassy sheet while the stipple texture remains visible.
+          if (dotRegion > 0.5) sizeJitter = 0.96 + 0.08 * cellRnd.x;
+          float targetRadius = 0.44 * dotScale * sizeJitter;
+          if (dotRegion > 0.5) targetRadius *= 1.90;
+
+          // In the dark upper 50% background, keep dots smaller and sparser near the top
+          // so the dark theme feels sleek, minimal, and atmospheric
+          if (dotRegion < 0.5) {
+            float skyFade = smoothstep(0.98, 0.48, dotUvY);
+            targetRadius *= 0.58 + 0.36 * skyFade;
+          }
+
+          float aaWidth = clamp(0.65 * gridDensity / max(uResolution.y, 1.0), 0.04, 0.20);
+          float dotMask = 1.0 - smoothstep(targetRadius - aaWidth, targetRadius + aaWidth, minDist);
+
+          // Subtle convex pigment dome shading inside each individual dot so every dot
+          // reads as a crisp, dimensional pointillist dab
+          vec2 normDelta = bestDelta / max(targetRadius, 0.001);
+          float dome = sqrt(max(0.0, 1.0 - min(dot(normDelta, normDelta), 1.0)));
+          float dotHighlight = smoothstep(0.75, 0.0, length(normDelta - vec2(-0.22, 0.26)));
+
+          vec3 shadedDotColor = dotColor * (0.82 + 0.24 * dome);
+          if (dotRegion > 0.5) {
+            shadedDotColor += vec3(0.10, 0.22, 0.26) * dotHighlight * (0.35 + 0.45 * clamp(dotRegion - 1.0, 0.0, 1.0));
+          }
+
+          vec3 finalColor = mix(darkGround, shadedDotColor, dotMask);
+
+          // -----------------------------------------------------------------------
+          // 5. COMPOSITE BALLISTIC SPLASH PLUMES & FLOATING CREST DROPLET DOTS
+          // -----------------------------------------------------------------------
+          vec4 splashDot = evaluateSplashAndSprayDots(p, uv.y, uTime, pixelSize, waveFront);
+          finalColor = mix(finalColor, splashDot.rgb, splashDot.a);
+
+          gl_FragColor = vec4(clamp(finalColor, 0.0, 1.0), 1.0);
+        }
+      `;
+
+      function compileShader(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+          gl.deleteShader(shader);
+          return null;
+        }
+        return shader;
+      }
+
+      const vs = compileShader(gl.VERTEX_SHADER, vertexShaderSource);
+      const fs = compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource);
+      if (!vs || !fs) return;
+
+      const program = gl.createProgram();
+      gl.attachShader(program, vs);
+      gl.attachShader(program, fs);
+      gl.linkProgram(program);
+
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Program link error:', gl.getProgramInfoLog(program));
+        return;
+      }
+
+      gl.useProgram(program);
+
+      const quadBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1.0, -1.0, 3.0, -1.0, -1.0, 3.0]),
+        gl.STATIC_DRAW
+      );
+
+      const aPositionLoc = gl.getAttribLocation(program, 'aPosition');
+      gl.enableVertexAttribArray(aPositionLoc);
+      gl.vertexAttribPointer(aPositionLoc, 2, gl.FLOAT, false, 0, 0);
+
+      const uResolutionLoc = gl.getUniformLocation(program, 'uResolution');
+      const uTimeLoc = gl.getUniformLocation(program, 'uTime');
+      const uMouseLoc = gl.getUniformLocation(program, 'uMouse');
+      const uMouseEnergyLoc = gl.getUniformLocation(program, 'uMouseEnergy');
+      const uSplashLocs = [];
+      for (let i = 0; i < 16; i++) {
+        uSplashLocs.push(gl.getUniformLocation(program, `uSplashes[${i}]`));
+      }
+      const uActiveSplashesLoc = gl.getUniformLocation(program, 'uActiveSplashes');
+      const uDotDensityLoc = gl.getUniformLocation(program, 'uDotDensity');
+
+      // Ambient bubbles are animated entirely on the CPU and shipped as a vec4 array
+      // (x, y, radius, fade) — the shader used to rebuild all 18 trajectories from
+      // hashes for every single pixel, including pixels in the empty sky.
+      const BUBBLE_COUNT = 40;
+      const uBubbleLocs = [];
+      for (let b = 0; b < BUBBLE_COUNT; b++) {
+        uBubbleLocs.push(gl.getUniformLocation(program, `uBubbles[${b}]`));
+      }
+
+      const FISH_COUNT = 9;
+      const uFishALocs = [];
+      const uFishBLocs = [];
+      for (let f = 0; f < FISH_COUNT; f++) {
+        uFishALocs.push(gl.getUniformLocation(program, `uFishA[${f}]`));
+        uFishBLocs.push(gl.getUniformLocation(program, `uFishB[${f}]`));
+      }
+
+      const GULL_COUNT = 5;
+      const uGullALocs = [];
+      const uGullBLocs = [];
+      for (let g = 0; g < GULL_COUNT; g++) {
+        uGullALocs.push(gl.getUniformLocation(program, `uGullA[${g}]`));
+        uGullBLocs.push(gl.getUniformLocation(program, `uGullB[${g}]`));
+      }
+
+      const uAudioLoc = gl.getUniformLocation(program, 'uAudio');
+      const uBeatLoc = gl.getUniformLocation(program, 'uBeat');
+
+      const JELLY_COUNT = 2;
+      const uJellyALocs = [];
+      const uJellyBLocs = [];
+      for (let j = 0; j < JELLY_COUNT; j++) {
+        uJellyALocs.push(gl.getUniformLocation(program, `uJellyA[${j}]`));
+        uJellyBLocs.push(gl.getUniformLocation(program, `uJellyB[${j}]`));
+      }
+
+      function fract(x) { return x - Math.floor(x); }
+      function mod(x, y) { return x - y * Math.floor(x / y); }
+      function hash11(p) {
+        p = fract(p * 0.1031);
+        p *= p + 33.33;
+        p *= p + p;
+        return fract(p);
+      }
+      function sstep(a, b, x) {
+        const k = Math.min(1, Math.max(0, (x - a) / (b - a)));
+        return k * k * (3 - 2 * k);
+      }
+
+      // =========================================================================
+      // SYSTEM AUDIO REACTIVITY (Lively --audio API)
+      // =========================================================================
+      // Lively calls livelyAudioListener() with a 128-bin system-audio spectrum.
+      // Analysis is one cheap pass per callback; the per-frame cost is four lerps.
+      const audio = {
+        bass: 0.0,
+        mid: 0.0,
+        treble: 0.0,
+        level: 0.0,
+        targetBass: 0.0,
+        targetMid: 0.0,
+        targetTreble: 0.0,
+        targetLevel: 0.0,
+        beat: 0.0,
+        beatAverage: 0.0,
+        lastDataMs: -1e9
+      };
+
+      // LivelyProperties controls (set through livelyPropertyListener below)
+      let audioSensitivity = 1.0;
+      let seaLifeDensity = 1.0;
+      let splashStrength = 1.0;
+
+      window.livelyAudioListener = function (audioArray) {
+        if (!audioArray || !audioArray.length) return;
+        const n = audioArray.length;
+        const bassEnd = Math.max(1, Math.round(n * 0.0625));
+        const midEnd = Math.max(bassEnd + 1, Math.round(n * 0.25));
+        let bass = 0.0;
+        let mid = 0.0;
+        let treble = 0.0;
+        let sum = 0.0;
+
+        for (let i = 0; i < n; i++) {
+          const v = Math.min(Math.max(Number(audioArray[i]) || 0.0, 0.0), 1.5);
+          sum += v;
+          if (i < bassEnd) bass += v;
+          else if (i < midEnd) mid += v;
+          else treble += v;
+        }
+
+        const sens = audioSensitivity;
+        audio.targetBass = Math.min(1.0, (bass / bassEnd) * 1.5 * sens);
+        audio.targetMid = Math.min(1.0, (mid / Math.max(1, midEnd - bassEnd)) * 2.4 * sens);
+        audio.targetTreble = Math.min(1.0, (treble / Math.max(1, n - midEnd)) * 5.0 * sens);
+        audio.targetLevel = Math.min(1.0, (sum / n) * 3.4 * sens);
+        audio.lastDataMs = performance.now();
+      };
+
+      function updateAudio(dt) {
+        const attack = 1.0 - Math.exp(-dt * 20.0);
+        const release = 1.0 - Math.exp(-dt * 2.6);
+
+        // Lively paused, the page is in a browser, or the track stopped: let the sea calm.
+        if (performance.now() - audio.lastDataMs > 700.0) {
+          const decay = Math.exp(-dt * 1.4);
+          audio.targetBass *= decay;
+          audio.targetMid *= decay;
+          audio.targetTreble *= decay;
+          audio.targetLevel *= decay;
+        }
+
+        audio.bass += (audio.targetBass - audio.bass) * (audio.targetBass > audio.bass ? attack : release);
+        audio.mid += (audio.targetMid - audio.mid) * (audio.targetMid > audio.mid ? attack : release);
+        audio.treble += (audio.targetTreble - audio.treble) * (audio.targetTreble > audio.treble ? attack : release);
+        audio.level += (audio.targetLevel - audio.level) * (audio.targetLevel > audio.level ? attack : release);
+
+        // Soft bass-onset envelope for crest sparkle and jellyfish glow (never a strobe)
+        audio.beatAverage += (audio.bass - audio.beatAverage) * (1.0 - Math.exp(-dt * 1.8));
+        const onset = audio.bass - audio.beatAverage;
+        if (onset > 0.045 && audio.bass > 0.14) {
+          audio.beat = Math.min(1.0, audio.beat + onset * 4.0);
+        }
+        audio.beat *= Math.exp(-dt * 5.2);
+      }
+
+      // =========================================================================
+      // SEA LIFE SIMULATED ON THE CPU
+      // =========================================================================
+      // Jellyfish: random calm wander, realistic pulse-and-glide, wave orbital sway
+      // and a heavy viscous response to the cursor. Fish follow the same rules.
+      const jellies = [];
+      for (let j = 0; j < JELLY_COUNT; j++) {
+        jellies.push({
+          x: j === 0 ? -0.30 : 0.34,
+          y: j === 0 ? 0.205 : 0.300,
+          vx: 0.0,
+          vy: 0.0,
+          baseW: j === 0 ? 0.042 : 0.052,
+          baseH: j === 0 ? 0.026 : 0.032,
+          wanderAngle: Math.random() * Math.PI * 2.0,
+          wanderTimer: 1.0 + Math.random() * 3.0,
+          depthTarget: 0.16 + Math.random() * 0.18,
+          pulseTime: Math.random() * 2.0,
+          pulseInterval: 2.2 + Math.random() * 2.2,
+          contract: 0.0,
+          tentaclePhase: Math.random() * Math.PI * 2.0,
+          lean: 0.0,
+          seed: Math.random() * 10.0
+        });
+      }
+
+      const fish = [];
+      for (let f = 0; f < FISH_COUNT; f++) {
+        const ff = f;
+        const big = ff >= 5.5 ? 1.0 : 0.0;
+        fish.push({
+          x: null,
+          y: 0.0,
+          vx: 0.0,
+          vy: 0.0,
+          dir: ff % 3 < 1.5 ? 1.0 : -1.0,
+          speed: 0.020 + 0.010 * hash11(ff * 11.37),
+          laneY: 0.085 + 0.275 * hash11(ff * 2.31 + 9.0),
+          size: big ? 0.030 + 0.008 * hash11(ff * 3.71) : 0.017 + 0.005 * hash11(ff * 7.13),
+          big: big,
+          phase: hash11(ff * 9.1) * 6.283,
+          wanderPhase: hash11(ff * 4.7) * 6.283,
+          wanderSpeed: 0.18 + 0.12 * hash11(ff * 6.3)
+        });
+      }
+
+      function updateJellies(t, dt) {
+        const halfW = Math.max(0.5 * aspect, 0.5);
+        const minX = -halfW * 0.93;
+        const maxX = halfW * 0.93;
+        const mouseInWater = mouse.waterEnergy > 0.001;
+        const visibleJellies = Math.round(JELLY_COUNT * seaLifeDensity);
+
+        for (let j = 0; j < JELLY_COUNT; j++) {
+          const jf = jellies[j];
+          if (j >= visibleJellies) {
+            gl.uniform4f(uJellyALocs[j], 99.0, 0.5, 0.040, 0.026);
+            gl.uniform4f(uJellyBLocs[j], 0.0, 0.0, 0.0, 1.0);
+            continue;
+          }
+
+          // Random headings at random intervals: a natural, never-repeating wander
+          jf.wanderTimer -= dt;
+          if (jf.wanderTimer <= 0.0) {
+            jf.wanderAngle = (Math.random() * 2.0 - 1.0) * Math.PI * 0.9;
+            jf.wanderTimer = 1.8 + Math.random() * 4.2;
+            jf.depthTarget = 0.16 + Math.random() * 0.18;
+          }
+
+          // Realistic bell cycle: a short contraction produces one upward glide,
+          // then the bell relaxes and the animal drifts while slowly sinking.
+          jf.pulseTime += dt;
+          if (jf.pulseTime >= jf.pulseInterval) {
+            jf.pulseTime -= jf.pulseInterval;
+            jf.pulseInterval = 2.3 + Math.random() * 2.3;
+          }
+          const cycle = jf.pulseTime / jf.pulseInterval;
+          const burst = cycle < 0.20 ? Math.sin((cycle / 0.20) * Math.PI) : 0.0;
+          jf.contract = burst;
+          jf.vy += burst * 0.055 * dt;
+          jf.vy -= 0.0018 * dt;
+          // Very weak, heavily overdamped depth preference: jellies hover in the
+          // midwater instead of slowly sinking to the floor. No visible oscillation.
+          jf.vy += (jf.depthTarget - jf.y) * 0.010 * dt;
+
+          // Slow random drift plus the surface wave's orbital motion at depth
+          const depth = Math.max(0.02, 0.50 - jf.y);
+          const waveCouple = Math.exp(-depth * 2.6);
+          const surf = estimateWaterSurfaceY(jf.x, t);
+          jf.vx += Math.cos(jf.wanderAngle) * 0.014 * dt;
+          jf.vx += Math.cos(t * 0.62 + jf.seed) * 0.020 * waveCouple * dt;
+          jf.vy += (surf - 0.496) * 0.22 * waveCouple * dt;
+          jf.vy += Math.sin(t * 0.78 + jf.seed * 1.3) * 0.012 * waveCouple * dt;
+
+          // Direct cursor shove: heavy, viscous and non-elastic
+          let near = 0.0;
+          if (mouseInWater) {
+            const dx = jf.x - mouse.x;
+            const dy = jf.y - mouse.y;
+            const d2 = dx * dx + dy * dy;
+            near = Math.exp(-d2 / 0.030) * mouse.waterEnergy;
+            if (near > 0.002) {
+              const inv = 1.0 / Math.sqrt(d2 + 1e-6);
+              jf.vx += dx * inv * near * 0.030 * dt + mouse.velX * near * 0.012 * dt;
+              jf.vy += dy * inv * near * 0.027 * dt + mouse.velY * near * 0.012 * dt;
+            }
+          }
+
+          // Viscous damping, speed limit, integration
+          jf.vx *= Math.exp(-dt * 1.5);
+          jf.vy *= Math.exp(-dt * 1.35);
+          const speed = Math.hypot(jf.vx, jf.vy);
+          if (speed > 0.085) {
+            const k = 0.085 / speed;
+            jf.vx *= k;
+            jf.vy *= k;
+          }
+          jf.x += jf.vx * dt;
+          jf.y += jf.vy * dt;
+
+          // Soft steering at the bounds; never a rubbery bounce
+          if (jf.x < minX) {
+            jf.x = minX;
+            jf.vx = Math.abs(jf.vx) * 0.25;
+            jf.wanderAngle = Math.random() * Math.PI * 0.5;
+          } else if (jf.x > maxX) {
+            jf.x = maxX;
+            jf.vx = -Math.abs(jf.vx) * 0.25;
+            jf.wanderAngle = Math.PI * 0.5 + Math.random() * Math.PI * 0.5;
+          }
+          if (jf.y > 0.455) {
+            jf.y = 0.455;
+            jf.vy = -Math.abs(jf.vy) * 0.3;
+          } else if (jf.y < 0.055) {
+            jf.y = 0.055;
+            jf.vy = Math.abs(jf.vy) * 0.3;
+          }
+
+          // Bell contraction proportions, trailing tentacles and audio/beat glow
+          const bellW = jf.baseW * (1.0 - 0.15 * burst - audio.beat * 0.02);
+          const bellH = jf.baseH * (1.0 + 0.13 * burst);
+          const tentacleAmp = 0.0032 + 0.010 * Math.min(1.0, speed * 26.0) + near * 0.0015;
+          jf.tentaclePhase += dt * (1.5 + audio.bass * 1.1);
+          jf.lean = Math.max(-0.06, Math.min(0.06, -jf.vx * 2.4));
+          const glow = 1.0 + audio.beat * 0.45 + audio.bass * 0.20;
+
+          gl.uniform4f(uJellyALocs[j], jf.x, jf.y, bellW, bellH);
+          gl.uniform4f(uJellyBLocs[j], tentacleAmp, jf.tentaclePhase, jf.lean, glow);
+        }
+      }
+
+      function uploadBubbles(t) {
+        const halfW = 0.5 * aspect;
+        const waterE = mouse.waterEnergy;
+        for (let b = 0; b < BUBBLE_COUNT; b++) {
+          const fb = b;
+
+          // The last 24 bubbles cling to the underside of the surface instead of
+          // rising. They ride the swell and shimmer, the way aerated water holds
+          // bubbles against a wave face.
+          if (b >= BUBBLE_COUNT - 24) {
+            const sb = b - (BUBBLE_COUNT - 24);
+            const sseed = sb * 23.71 + 5.13;
+            const sway = Math.sin(t * 0.35 + sb * 1.7) * 0.012;
+            const bx = (hash11(sseed + 2.0) * 2.0 - 1.0) * halfW * 0.90 + sway;
+            const surf = estimateWaterSurfaceY(bx, t);
+            const depthB = 0.008 + 0.080 * hash11(sseed + 7.0);
+            const pulse = 0.5 + 0.5 * Math.sin(t * 0.9 + sb * 2.3);
+            const radius = (0.0014 + 0.0026 * hash11(sseed + 3.0)) * (0.80 + 0.30 * pulse);
+            gl.uniform4f(uBubbleLocs[b], bx, surf - depthB, radius, 0.45 + 0.45 * pulse);
+            continue;
+          }
+
+          const seed = fb * 37.13 + 2.7;
+          const cycle = 6.5 + 6.0 * hash11(seed + 1.9);
+          const phase = hash11(seed + 4.2);
+          const life = fract(t / cycle + phase);
+          if (life < 0.02 || life > 0.985) {
+            gl.uniform4f(uBubbleLocs[b], 0.0, 0.0, 0.0, 0.0);
+            continue;
+          }
+
+          let colX = (hash11(seed + 6.1) * 2.0 - 1.0) * halfW * 0.92;
+          const startY = 0.015 + 0.26 * hash11(seed + 8.3);
+          let riseY = startY + (0.470 - startY) * sstep(0.0, 1.0, life);
+
+          // Slow lazy wobble as they decompress on the way up
+          colX += Math.sin(t * 1.1 + fb * 2.7) * 0.006 + Math.sin(t * 2.3 + fb * 5.1) * 0.0025;
+          let yB = riseY + Math.sin(t * 3.0 + fb * 1.3) * 0.0025;
+
+          // The swell carries the bubbles; the cursor bends them aside with a viscous
+          // swirl that relaxes as the pointer's energy fades (no bouncing).
+          const surf = estimateWaterSurfaceY(colX, t) - 0.496;
+          colX += surf * 0.060;
+          yB += surf * 0.035;
+          if (waterE > 0.001) {
+            const dx = colX - mouse.x;
+            const dy = yB - mouse.y;
+            const near = Math.exp(-(dx * dx + dy * dy) * 42.0) * waterE;
+            if (near > 0.001) {
+              colX += (dx >= 0.0 ? 1.0 : -1.0) * near * 0.014 + mouse.velX * near * 0.010;
+              yB += (dy >= 0.0 ? 1.0 : -1.0) * near * 0.010 + mouse.velY * near * 0.010;
+            }
+          }
+
+          // Audio: the column breathes with the music; bubbles swell slightly and brighten
+          // Bias toward many tiny glass beads with a few larger ones, like real aerated water
+          const radius =
+            (0.0013 + 0.0047 * Math.pow(hash11(seed + 3.3), 1.7)) * (1.0 + audio.bass * 0.12);
+          const fade = Math.min(
+            1.0,
+            sstep(0.02, 0.10, life) * (1.0 - sstep(0.80, 0.985, life)) * (1.0 + audio.level * 0.22)
+          );
+
+          gl.uniform4f(uBubbleLocs[b], colX, yB, radius, fade);
+        }
+      }
+
+      // Fish school: persistent CPU motion (waves, cursor gusts, overdamped lanes)
+      // then one vec4 pair per fish per frame — no per-pixel hashes remain.
+      function uploadFish(t, dt) {
+        const swimSpan = Math.max(0.55, 0.5 * aspect * 1.35);
+        const waterE = mouse.waterEnergy;
+        const visibleFish = Math.round(FISH_COUNT * seaLifeDensity);
+
+        for (let f = 0; f < FISH_COUNT; f++) {
+          const fd = fish[f];
+          if (f >= visibleFish) {
+            gl.uniform4f(uFishALocs[f], 99.0, 99.0, 0.001, fd.dir);
+            gl.uniform4f(uFishBLocs[f], 0.0, 0.0, 0.0, 0.0);
+            continue;
+          }
+          if (fd.x === null) {
+            fd.x = (Math.random() * 2.0 - 1.0) * swimSpan;
+            fd.y = 0.5 - fd.laneY;
+          }
+
+          // Wave-coupled lane: fish near the surface ride the swell, deep ones barely move
+          const depth = Math.max(0.0, 0.49 - fd.y);
+          const wavePull = (estimateWaterSurfaceY(fd.x, t) - 0.496) * Math.exp(-depth * 4.2) * 0.55;
+          const wander =
+            Math.sin(t * fd.wanderSpeed + fd.wanderPhase) * 0.010 +
+            Math.sin(t * fd.wanderSpeed * 0.41 + fd.phase) * 0.006;
+          const targetY = 0.5 - fd.laneY + wander + wavePull;
+
+          // Overdamped lane holding (no spring overshoot)
+          fd.vy += (targetY - fd.y) * 0.9 * dt;
+          fd.vy *= Math.exp(-dt * 2.4);
+
+          // Heavy cursor displacement: fish are pushed aside, never launched
+          if (waterE > 0.001) {
+            const dx = fd.x - mouse.x;
+            const dy = fd.y - mouse.y;
+            const d2 = dx * dx + dy * dy;
+            const near = Math.exp(-d2 * 24.0) * waterE;
+            if (near > 0.001) {
+              const inv = 1.0 / Math.sqrt(d2 + 1e-6);
+              fd.vx += (dx * inv * near * 0.05 + mouse.velX * near * 0.04) * dt;
+              fd.vy += (dy * inv * near * 0.08 + mouse.velY * near * 0.04) * dt;
+            }
+          }
+
+          // Slowly rejoin the school heading
+          fd.vx += (fd.dir * fd.speed - fd.vx) * (1.0 - Math.exp(-dt * 1.4));
+          fd.x += fd.vx * dt;
+          fd.y += fd.vy * dt;
+
+          if (fd.x > swimSpan) fd.x -= swimSpan * 2.0;
+          else if (fd.x < -swimSpan) fd.x += swimSpan * 2.0;
+          if (fd.y < 0.040) fd.y = 0.040;
+          else if (fd.y > 0.462) fd.y = 0.462;
+
+          const pitch = Math.max(-0.45, Math.min(0.45, Math.atan2(fd.vy, Math.abs(fd.vx) + 0.008)));
+          const flap = Math.sin(t * (6.4 + fd.speed * 40.0) + fd.phase) * 0.18;
+
+          gl.uniform4f(uFishALocs[f], fd.x, fd.y, fd.size, fd.dir);
+          gl.uniform4f(uFishBLocs[f], pitch, flap, fd.big, 0.0);
+        }
+      }
+
+      // Seagulls: same treatment for the five birds in the upper half. The cursor
+      // stirs the air and the flock slides away from it, then drifts back as the
+      // air energy decays — a soft gust, never a bounce.
+      function uploadGulls(t) {
+        const gullSpan = 0.5 * aspect * 1.25;
+        const airE = mouse.airEnergy;
+        const visibleGulls = Math.round(GULL_COUNT * seaLifeDensity);
+        for (let g = 0; g < GULL_COUNT; g++) {
+          const fg = g;
+          const gDir = fg % 2 < 1 ? 1.0 : -1.0;
+          if (g >= visibleGulls) {
+            gl.uniform4f(uGullALocs[g], 99.0, 0.8, 0.001, gDir);
+            gl.uniform4f(uGullBLocs[g], 0.0, 0.0, 0.0, 0.0);
+            continue;
+          }
+          const gSpeed = (0.045 + 0.030 * hash11(fg * 4.31)) * gDir;
+          let gx = mod(t * gSpeed + hash11(fg * 6.17) * 4.0, gullSpan * 2.0) - gullSpan;
+          let gy = 0.655 + 0.205 * hash11(fg * 8.53 + 2.0) + Math.sin(t * 0.43 + fg * 2.1) * 0.010;
+          const W = 0.026 + 0.015 * hash11(fg * 3.97);
+          const beat = 0.90 * Math.sin(t * (2.3 + 0.9 * hash11(fg * 1.7)) + fg * 1.4);
+
+          if (airE > 0.001) {
+            const dx = gx - mouse.x;
+            const dy = gy - mouse.y;
+            const d2 = dx * dx + dy * dy;
+            const near = Math.exp(-d2 * 22.0) * airE;
+            if (near > 0.001) {
+              const inv = 1.0 / Math.sqrt(d2 + 1e-6);
+              gx += dx * inv * near * 0.045 + mouse.velX * near * 0.008;
+              gy += dy * inv * near * 0.030 + mouse.velY * near * 0.008;
+            }
+          }
+          if (gy < 0.600) gy = 0.600;
+          else if (gy > 0.940) gy = 0.940;
+
+          gl.uniform4f(uGullALocs[g], gx, gy, W, gDir);
+          gl.uniform4f(uGullBLocs[g], beat, 0.0, 0.0, 0.0);
+        }
+      }
+
+      // =========================================================================
+      // AUTO-RESIZE & GPU-BUDGETED DISPLAY ADAPTATION
+      // =========================================================================
+      let width = 1;
+      let height = 1;
+      let aspect = 1;
+
+      // The pointillist shader is fill-rate heavy (several wave solves, sea life and
+      // splash loops per pixel), so the framebuffer is scaled in two stages:
+      //   baseScale — supersampling requested from the display's pixel ratio (2-3x)
+      //   perfScale — adaptive, tuned to measured frame times below, but never below
+      //                the point where baseScale * perfScale == 1 (native CSS pixels)
+      // Absolute cap: a native 4K frame is ~8.3 MP, so nothing here is ever softer than
+      // native — but a 2-3x supersampled 4K/5K frame (16-33 MP) can never be queued.
+      const MAX_PIXELS = 12000000;
+
+      function readBaseScale() {
+        // Supersample again: this is what made the stipple crisp and fine-grained.
+        return Math.min(Math.max(window.devicePixelRatio || 1, 2.0), 3.0);
+      }
+
+      let baseScale = readBaseScale();
+      let perfScale = 1.0;
+
+      // Lowest adaptive factor that still renders at native CSS resolution or better
+      function minPerfScale() {
+        return Math.min(1.0, 1.0 / Math.max(baseScale, 1.0));
+      }
+
+      function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const cssW = rect.width || window.innerWidth;
+        const cssH = rect.height || window.innerHeight;
+
+        let scale = baseScale * perfScale;
+        const pixelCount = cssW * cssH * scale * scale;
+        if (pixelCount > MAX_PIXELS) {
+          scale = Math.sqrt(MAX_PIXELS / Math.max(cssW * cssH, 1));
+        }
+        scale = Math.max(scale, Math.min(1.0, baseScale)); // never sub-native
+
+        const displayW = Math.max(1, Math.round(cssW * scale));
+        const displayH = Math.max(1, Math.round(cssH * scale));
+
+        if (canvas.width !== displayW || canvas.height !== displayH) {
+          canvas.width = displayW;
+          canvas.height = displayH;
+          width = displayW;
+          height = displayH;
+          aspect = width / height;
+          gl.viewport(0, 0, width, height);
+        }
+
+        // Dot density tracks CSS height (~2.2 px per dot row), independent of render
+        // scale: 1080p -> 491 rows, 1440p -> 655, 4K -> 1100 (clamped).
+        gl.uniform1f(uDotDensityLoc, Math.min(Math.max(cssH / 2.2, 320.0), 1100.0));
+      }
+
+      window.addEventListener(
+        'resize',
+        function () {
+          baseScale = readBaseScale(); // pixel ratio can change when moving between monitors
+          resize();
+        },
+        { passive: true }
+      );
+      resize();
+
+      // =========================================================================
+      // LIVELY MOUSE SPLASH & AIR/WATER SEPARATED CONTROLLER
+      // =========================================================================
+      const NUM_SPLASHES = 16;
+      const splashes = Array.from({ length: NUM_SPLASHES }, () => ({
+        x: 0.0,
+        y: 0.5,
+        birthTime: -100.0,
+        packedVelAndStrength: 0.0
+      }));
+      let nextSplashIdx = 0;
+      let lastSplashSpawnTime = -10.0;
+
+      let simTime = 0.0;
+      let speedMultiplier = 1.0;
+
+      const mouse = {
+        targetX: 0.0,
+        targetY: 0.5,
+        x: 0.0,
+        y: 0.5,
+        velX: 0.0,
+        velY: 0.0,
+        waterEnergy: 0.0,
+        targetWaterEnergy: 0.0,
+        airEnergy: 0.0,
+        targetAirEnergy: 0.0,
+        initialized: false
+      };
+
+      // Approximate current water surface Y at aspectX so JS strictly separates water vs air
+      function estimateWaterSurfaceY(aspectX, t) {
+        const p1 = aspectX * 3.15 - t * 0.437;
+        const c1 = Math.cos(p1);
+        const ridge = Math.pow(Math.max(c1, 0.0), 7.0) * 0.042;
+        const w1 = c1 * 0.068 + ridge;
+        const w2 = Math.cos(aspectX * 5.60 - t * 0.646 + 4.7) * 0.018;
+        const w3 = Math.cos(aspectX * 1.60 - t * 0.24 + 3.1) * 0.026;
+        return 0.496 + w1 + w2 + w3;
+      }
+
+      function packSplashParams(velX, strength) {
+        const vClamped = Math.max(-2.2, Math.min(2.2, velX));
+        const vBucket = Math.max(0, Math.min(100, Math.round((vClamped / 2.2 + 1.0) * 50.0)));
+        const sEncoded = Math.max(0.02, Math.min(0.95, strength * 0.5));
+        return vBucket + sEncoded;
+      }
+
+      function spawnSplashAtSource(aspectX, uvY, velX, baseImpulse) {
+        // Strictly spawn water splashes ONLY when the source is at or below the water surface
+        if (splashStrength <= 0.001) return;
+        const surfY = estimateWaterSurfaceY(aspectX, simTime);
+        if (uvY > surfY + 0.012) return;
+
+        const s = splashes[nextSplashIdx];
+        s.x = aspectX;
+        s.y = uvY;
+        s.birthTime = simTime;
+        const clampedImpulse = Math.max(0.08, Math.min(1.65, baseImpulse * splashStrength));
+        s.packedVelAndStrength = packSplashParams(velX, clampedImpulse);
+        nextSplashIdx = (nextSplashIdx + 1) % NUM_SPLASHES;
+      }
+
+      function onPointerActivity(clientX, clientY, isClick) {
+        const normX = clientX / Math.max(window.innerWidth, 1);
+        const normY = 1.0 - clientY / Math.max(window.innerHeight, 1);
+        const aspectX = (normX - 0.5) * aspect;
+
+        if (!mouse.initialized) {
+          mouse.x = aspectX;
+          mouse.y = normY;
+          mouse.targetX = aspectX;
+          mouse.targetY = normY;
+          mouse.initialized = true;
+        }
+
+        const dx = aspectX - mouse.targetX;
+        const dy = normY - mouse.targetY;
+        const moveDist = Math.hypot(dx, dy);
+
+        mouse.targetX = aspectX;
+        mouse.targetY = normY;
+
+        const surfY = estimateWaterSurfaceY(aspectX, simTime);
+        const isInWater = normY <= surfY + 0.012;
+        const moveIntensity = Math.min(moveDist * 28.0, 1.45);
+
+        if (isInWater) {
+          // Cursor is in or on the water: trigger splash right at (aspectX, normY)
+          if (isClick) {
+            mouse.targetWaterEnergy = Math.min(1.5, mouse.targetWaterEnergy + 1.05 * splashStrength);
+            spawnSplashAtSource(aspectX, normY, dx * 26.0, 1.35);
+            lastSplashSpawnTime = simTime;
+          } else if (moveDist > 0.002) {
+            mouse.targetWaterEnergy = Math.min(1.45, mouse.targetWaterEnergy + moveIntensity * 0.72 * splashStrength);
+            if (simTime - lastSplashSpawnTime > 0.042) {
+              lastSplashSpawnTime = simTime;
+              const splashImpulse = 0.52 + moveIntensity * 0.78;
+              spawnSplashAtSource(aspectX, normY, dx * 32.0, splashImpulse);
+            }
+          }
+        } else {
+          // Cursor is in the top 50% air: NOTHING happens to the water; only stir the air locally
+          if (isClick || moveDist > 0.0015) {
+            const airBoost = isClick ? 0.85 : moveIntensity * 0.65;
+            mouse.targetAirEnergy = Math.min(1.25, mouse.targetAirEnergy + airBoost);
+          }
+        }
+      }
+
+      window.addEventListener(
+        'pointermove',
+        (e) => {
+          onPointerActivity(e.clientX, e.clientY, false);
+        },
+        { passive: true }
+      );
+
+      window.addEventListener(
+        'pointerdown',
+        (e) => {
+          onPointerActivity(e.clientX, e.clientY, true);
+        },
+        { passive: true }
+      );
+
+      window.livelyPropertyListener = function (name, val) {
+        // Lively calls this once on load for each LivelyProperties control, then on change.
+        const parsed = parseFloat(val);
+        if (!Number.isFinite(parsed)) return;
+
+        if (name === 'audioSensitivity') {
+          audioSensitivity = Math.min(2.0, Math.max(0.0, parsed / 100.0));
+        } else if (name === 'seaLifeDensity') {
+          seaLifeDensity = Math.min(1.0, Math.max(0.0, parsed / 100.0));
+        } else if (name === 'splashStrength') {
+          splashStrength = Math.min(2.0, Math.max(0.0, parsed / 100.0));
+        } else if (name === 'waveSpeed') {
+          if (parsed > 0.0) speedMultiplier = parsed;
+        }
+      };
+
+      // =========================================================================
+      // RENDER LOOP — GPU-AWARE (112FPS+ READY)
+      // =========================================================================
+      let lastFrameMs = performance.now();
+      let rafPending = false;
+      let pageVisible = !document.hidden;
+
+      // Frame-time telemetry. refreshMs is a low percentile of the recent intervals
+      // (the display's vsync period), rawDtEMA a smoothed interval; the gap between
+      // them is what tells us whether the GPU is keeping up.
+      const dtWindow = [];
+      let rawDtEMA = 1000 / 60;
+      let refreshMs = 1000 / 60;
+      let framesSinceTune = 0;
+      let lastTuneMs = 0;
+
+      function tuneGpuBudget(rawDt, nowMs) {
+        // Throttled, stalled or resumed frames say nothing about GPU load
+        if (!(rawDt > 1.0) || rawDt > 60.0) return;
+
+        dtWindow.push(rawDt);
+        if (dtWindow.length > 120) dtWindow.shift();
+        rawDtEMA += (rawDt - rawDtEMA) * 0.07;
+
+        framesSinceTune += 1;
+        if (framesSinceTune < 45 || nowMs - lastTuneMs < 400) return;
+        framesSinceTune = 0;
+        lastTuneMs = nowMs;
+
+        // ~5th percentile of recent intervals: robust estimate of the frame cadence.
+        // Capped at 60Hz so a page the GPU has pushed down to 30fps is never mistaken
+        // for an intentionally slow display (any real display is at least ~50Hz).
+        const sorted = dtWindow.slice().sort(function (a, b) { return a - b; });
+        refreshMs = Math.min(Math.max(sorted[Math.floor(sorted.length * 0.05)] || 1000 / 60, 1000 / 360), 1000 / 60);
+
+        const budget = Math.max(refreshMs * 1.55, refreshMs + 3.0);
+        const floor = minPerfScale();
+        if (rawDtEMA > budget) {
+          // GPU is falling behind: shrink the framebuffer, but never past native CSS
+          // resolution — losing sharpness is the last thing we do, not the first.
+          if (perfScale > floor + 0.01) {
+            perfScale = Math.max(floor, perfScale * 0.88);
+            resize();
+          }
+        } else if (rawDtEMA < budget * 0.8 && perfScale < 1.0) {
+          // Comfortable headroom (20% below budget): grow back toward full
+          // supersampling, so resolution is restored as soon as the GPU allows it.
+          perfScale = Math.min(1.0, perfScale * 1.10);
+          resize();
+        }
+      }
+
+      function render(nowMs) {
+        rafPending = false;
+        const rawDt = nowMs - lastFrameMs;
+        const dt = Math.min(rawDt * 0.001, 0.05);
+        lastFrameMs = nowMs;
+        if (pageVisible) tuneGpuBudget(rawDt, nowMs);
+        simTime += dt * speedMultiplier;
+
+        const follow = 1.0 - Math.exp(-dt * 14.0);
+        const prevX = mouse.x;
+        const prevY = mouse.y;
+        mouse.x += (mouse.targetX - mouse.x) * follow;
+        mouse.y += (mouse.targetY - mouse.y) * follow;
+
+        const instVx = dt > 0.0001 ? (mouse.x - prevX) / dt : 0.0;
+        const instVy = dt > 0.0001 ? (mouse.y - prevY) / dt : 0.0;
+        mouse.velX = mouse.velX * Math.exp(-dt * 7.0) + Math.max(-2.5, Math.min(2.5, instVx)) * 0.32;
+        mouse.velY = mouse.velY * Math.exp(-dt * 7.0) + Math.max(-2.5, Math.min(2.5, instVy)) * 0.32;
+
+        mouse.targetWaterEnergy *= Math.exp(-dt * 3.2);
+        mouse.waterEnergy += (mouse.targetWaterEnergy - mouse.waterEnergy) * (1.0 - Math.exp(-dt * 8.5));
+
+        mouse.targetAirEnergy *= Math.exp(-dt * 3.8);
+        mouse.airEnergy += (mouse.targetAirEnergy - mouse.airEnergy) * (1.0 - Math.exp(-dt * 9.0));
+
+        updateAudio(dt);
+
+        gl.uniform2f(uResolutionLoc, width, height);
+        gl.uniform1f(uTimeLoc, simTime);
+        gl.uniform4f(uMouseLoc, mouse.x, mouse.y, mouse.velX, mouse.velY);
+        gl.uniform2f(uMouseEnergyLoc, mouse.waterEnergy, mouse.airEnergy);
+        gl.uniform4f(uAudioLoc, audio.bass, audio.mid, audio.treble, audio.level);
+        gl.uniform1f(uBeatLoc, audio.beat);
+
+        // Retire expired splash records so uActiveSplashes drops to 0 when the water
+        // is left alone — that is what lets the shader skip its splash loops.
+        let activeSplashes = 0;
+        for (let i = 0; i < NUM_SPLASHES; i++) {
+          const s = splashes[i];
+          const alive = s.packedVelAndStrength !== 0 && simTime - s.birthTime <= 4.4;
+          if (s.packedVelAndStrength !== 0 && !alive) s.packedVelAndStrength = 0;
+          if (alive) activeSplashes += 1;
+          gl.uniform4f(uSplashLocs[i], s.x, s.y, s.birthTime, s.packedVelAndStrength);
+        }
+        gl.uniform1f(uActiveSplashesLoc, activeSplashes);
+
+        // CPU-side per-frame entity state: pure math, once per frame
+        uploadBubbles(simTime);
+        uploadFish(simTime, dt);
+        uploadGulls(simTime);
+        updateJellies(simTime, dt);
+
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+        scheduleFrame();
+      }
+
+      function scheduleFrame() {
+        if (pageVisible && !rafPending) {
+          rafPending = true;
+          requestAnimationFrame(render);
+        }
+      }
+
+      // Stop burning GPU while the host hides the wallpaper (Lively pauses the page,
+      // or another window covers it) and reset the timing window on return so the
+      // hidden stretch is never mistaken for a slow frame.
+      document.addEventListener('visibilitychange', function () {
+        pageVisible = !document.hidden;
+        if (pageVisible) {
+          lastFrameMs = performance.now();
+          dtWindow.length = 0;
+          rawDtEMA = 1000 / 60;
+          scheduleFrame();
+        }
+      });
+
+      // Draw the first frame immediately so the wallpaper is complete even before
+      // the first animation frame is delivered, then continue on rAF.
+      window.__dbg = {
+        gl, audio, mouse,
+        get width(){ return width; },
+        get height(){ return height; },
+        get lastFrameMs(){ return lastFrameMs; },
+        get perfScale(){ return perfScale; },
+        set perfScale(v){ perfScale = v; resize(); },
+        render
+      };
+      render(performance.now());
+    })();
+  </script>
+
+  <script>
+    (function () {
+      'use strict';
+
+      const clockCanvas = document.getElementById('clock-canvas');
+      const ctx = clockCanvas.getContext('2d');
+      if (!ctx) return;
+
+      // Compact 5×7 dot-matrix alphabet for the clock
+      const GLYPHS = {
+        '0': ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
+        '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
+        '2': ['01110', '10001', '00001', '00010', '00100', '01000', '11111'],
+        '3': ['11111', '00010', '00100', '00010', '00001', '10001', '01110'],
+        '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
+        '5': ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
+        '6': ['00110', '01000', '10000', '11110', '10001', '10001', '01110'],
+        '7': ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
+        '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
+        '9': ['01110', '10001', '10001', '01111', '00001', '00010', '01100'],
+        ':': ['00000', '00000', '00100', '00000', '00100', '00000', '00000']
+      };
+
+      function hash(a, b, c) {
+        const n = Math.sin(a * 12.9898 + b * 78.233 + c * 37.719) * 43758.5453;
+        return n - Math.floor(n);
+      }
+
+      // ---------------------------------------------------------------------
+      // Viscous pointer interaction: clock beads shy away from the cursor,
+      // swell and brighten, then settle heavily back into place.
+      // ---------------------------------------------------------------------
+      const ptr = { x: -1e5, y: -1e5, has: false, targetEnergy: 0 };
+      let clockEnergy = 0;
+      let smoothX = -1e5;
+      let smoothY = -1e5;
+      let wasActive = false;
+      let lastFrameMs = performance.now();
+      let lastRenderedText = '';
+
+      function currentTimeText() {
+        const now = new Date();
+        return (
+          String(now.getHours()).padStart(2, '0') +
+          ':' +
+          String(now.getMinutes()).padStart(2, '0')
+        );
+      }
+
+      function renderClock(timeText) {
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const dpr = Math.min(Math.max(window.devicePixelRatio || 1, 1.25), 2.5);
+        const pixelW = Math.round(w * dpr);
+        const pixelH = Math.round(h * dpr);
+
+        if (clockCanvas.width !== pixelW || clockCanvas.height !== pixelH) {
+          clockCanvas.width = pixelW;
+          clockCanvas.height = pixelH;
+        }
+
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+
+        const minDim = Math.min(w, h);
+        const cell = Math.max(7, Math.min(34, minDim * 0.019, w * 0.03));
+        const glyphW = 5;
+        const glyphH = 7;
+        const gap = 1;
+        const totalCells = glyphW * timeText.length + gap * (timeText.length - 1);
+        const clockW = totalCells * cell;
+        const clockH = glyphH * cell;
+        const startX = (w - clockW) * 0.5;
+        const startY = h * 0.265 - clockH * 0.5;
+
+        // Build every lit bead once, applying the cursor's viscous push
+        const sigma = Math.max(52, cell * 3.4);
+        const sigma2 = 2 * sigma * sigma;
+        const beads = [];
+        for (let gi = 0; gi < timeText.length; gi++) {
+          const rows = GLYPHS[timeText[gi]];
+          if (!rows) continue;
+          const glyphX = startX + gi * (glyphW + gap) * cell;
+
+          for (let row = 0; row < glyphH; row++) {
+            for (let col = 0; col < glyphW; col++) {
+              if (rows[row][col] !== '1') continue;
+              const r = hash(gi + 1, row + 1, col + 1);
+              const r2 = hash(gi + 3, row + 7, col + 2);
+              let x = glyphX + (col + 0.5 + (r - 0.5) * 0.10) * cell;
+              let y = startY + (row + 0.5 + (r2 - 0.5) * 0.10) * cell;
+              let boost = 0;
+
+              if (clockEnergy > 0.0025 && ptr.has) {
+                const dx = x - smoothX;
+                const dy = y - smoothY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                const infl = Math.exp(-(dist * dist) / sigma2) * clockEnergy;
+                if (infl > 0.004) {
+                  const push = Math.min(infl * cell * 1.6, cell * 0.72);
+                  if (dist > 0.5) {
+                    x += (dx / dist) * push;
+                    y += (dy / dist) * push;
+                  }
+                  boost = infl;
+                }
+              }
+
+              beads.push({
+                x: x,
+                y: y,
+                r: r,
+                boost: boost,
+                light: hash(gi + 9, row + 4, col + 8)
+              });
+            }
+          }
+        }
+
+        ctx.globalCompositeOperation = 'lighter';
+
+        // Pass 1: soft cyan aura made of the same beads, barely there
+        for (let i = 0; i < beads.length; i++) {
+          const b = beads[i];
+          const radius = cell * (0.24 + 0.08 * b.r) * (1 + 0.5 * b.boost);
+
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, radius * 2.6, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(70, 200, 235, ' + (0.028 + 0.05 * b.boost).toFixed(4) + ')';
+          ctx.fill();
+        }
+
+        // Pass 2: crisp pointillist pigment beads with icy highlights
+        for (let i = 0; i < beads.length; i++) {
+          const b = beads[i];
+          const radius = cell * (0.235 + 0.075 * b.r) * (1 + 0.42 * b.boost);
+          const hue = 188 + (b.r - 0.5) * 12;
+          const lightness = Math.min(94, 70 + 16 * b.light + 15 * b.boost);
+          const alpha = Math.min(1, 0.78 + 0.20 * b.r + 0.30 * b.boost);
+
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, radius, 0, Math.PI * 2);
+          ctx.fillStyle =
+            'hsla(' + hue.toFixed(1) + ', 96%, ' + lightness.toFixed(1) + '%, ' + alpha.toFixed(3) + ')';
+          ctx.fill();
+
+          // Small convex glint so every bead reads as a liquid-glass pearl
+          if (radius > 1.4) {
+            ctx.beginPath();
+            ctx.arc(b.x - radius * 0.28, b.y - radius * 0.30, radius * 0.34, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(240, 253, 255, 0.68)';
+            ctx.fill();
+          }
+        }
+
+        ctx.globalCompositeOperation = 'source-over';
+      }
+
+      // Pointer drives the beads: energy builds while you move, then decays
+      window.addEventListener(
+        'pointermove',
+        function (e) {
+          const dx = e.clientX - ptr.x;
+          const dy = e.clientY - ptr.y;
+          const moved = ptr.has ? Math.sqrt(dx * dx + dy * dy) : 0;
+          if (!ptr.has) {
+            smoothX = e.clientX;
+            smoothY = e.clientY;
+            ptr.has = true;
+          }
+          ptr.x = e.clientX;
+          ptr.y = e.clientY;
+          if (moved > 0.001) {
+            ptr.targetEnergy = Math.min(1.6, ptr.targetEnergy + Math.min(moved * 0.045, 0.8));
+          }
+        },
+        { passive: true }
+      );
+
+      window.addEventListener(
+        'pointerdown',
+        function (e) {
+          if (!ptr.has) {
+            smoothX = e.clientX;
+            smoothY = e.clientY;
+            ptr.has = true;
+          }
+          ptr.x = e.clientX;
+          ptr.y = e.clientY;
+          ptr.targetEnergy = Math.min(1.7, ptr.targetEnergy + 1.05);
+        },
+        { passive: true }
+      );
+
+      function clockFrame(nowMs) {
+        const dt = Math.min((nowMs - lastFrameMs) * 0.001, 0.05);
+        lastFrameMs = nowMs;
+
+        ptr.targetEnergy *= Math.exp(-dt * 2.8);
+        clockEnergy += (ptr.targetEnergy - clockEnergy) * (1 - Math.exp(-dt * 7.5));
+
+        const follow = 1 - Math.exp(-dt * 6.5);
+        smoothX += (ptr.x - smoothX) * follow;
+        smoothY += (ptr.y - smoothY) * follow;
+
+        const text = currentTimeText();
+        const active = clockEnergy > 0.0025;
+        if (text !== lastRenderedText || active || (wasActive && !active)) {
+          lastRenderedText = text;
+          renderClock(text);
+        }
+        wasActive = active;
+      }
+
+      window.addEventListener(
+        'resize',
+        function () {
+          renderClock(currentTimeText());
+        },
+        { passive: true }
+      );
+      window.addEventListener(
+        'orientationchange',
+        function () {
+          renderClock(currentTimeText());
+        },
+        { passive: true }
+      );
+      document.addEventListener('visibilitychange', function () {
+        if (!document.hidden) renderClock(currentTimeText());
+      });
+
+      // Draw immediately, then tick on a timer: the clock stays correct even when
+      // a host throttles requestAnimationFrame (idle webviews, locked screens).
+      lastRenderedText = currentTimeText();
+      renderClock(lastRenderedText);
+      window.setInterval(function () {
+        clockFrame(performance.now());
+      }, 33);
+    })();
+  </script>
+</body>
+</html>

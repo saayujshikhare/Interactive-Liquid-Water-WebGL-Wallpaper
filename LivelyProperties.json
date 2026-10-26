@@ -1,0 +1,41 @@
+{
+  "audioLabel": {
+    "type": "label",
+    "value": "Audio"
+  },
+  "audioSensitivity": {
+    "max": 200,
+    "min": 0,
+    "step": 5,
+    "text": "Audio Sensitivity (%)",
+    "type": "slider",
+    "help": "How strongly the water, bubbles and jellyfish react to system audio.",
+    "value": 100
+  },
+  "lifeLabel": {
+    "type": "label",
+    "value": "Sea Life"
+  },
+  "seaLifeDensity": {
+    "max": 100,
+    "min": 0,
+    "step": 10,
+    "text": "Sea Life Density (%)",
+    "type": "slider",
+    "help": "How many fish, jellyfish and seagulls appear. Bubbles remain.",
+    "value": 100
+  },
+  "interactionLabel": {
+    "type": "label",
+    "value": "Interaction"
+  },
+  "splashStrength": {
+    "max": 200,
+    "min": 0,
+    "step": 5,
+    "text": "Splash Strength (%)",
+    "type": "slider",
+    "help": "Strength of mouse wakes and splashes. At 0 the water stays undisturbed.",
+    "value": 100
+  }
+}
